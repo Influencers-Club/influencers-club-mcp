@@ -1,0 +1,40 @@
+[project]
+name = "influencers-club-mcp"
+version = "1.0.0"
+description = "MCP server for the Influencers Club API - creator enrichment, discovery, and batch operations"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+authors = [
+    {name = "Gjorgji Petrovski"},
+]
+keywords = ["mcp", "influencers", "creators", "social-media", "enrichment", "discovery"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+]
+dependencies = [
+    "mcp[cli]>=1.0.0",
+    "httpx>=0.27.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/Influencers-Club/influencers-club-mcp"
+Repository = "https://github.com/Influencers-Club/influencers-club-mcp"
+Issues = "https://github.com/Influencers-Club/influencers-club-mcp/issues"
+
+[project.scripts]
+influencers-club-mcp = "influencers_club_mcp:mcp.run"
+
+[build-system]
+requires = ["setuptools>=75.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["influencers_club_mcp*"]
