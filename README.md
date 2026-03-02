@@ -121,7 +121,7 @@ This MCP server acts as a pass-through to the [Influencers Club API](https://api
 
 For issues, questions, or feature requests:
 
-- **Email:** gjorgji.p@influencers.club
+- **Email:** shaklev@influencers.club
 - **GitHub Issues:** [github.com/Influencers-Club/influencers-club-mcp/issues](https://github.com/Influencers-Club/influencers-club-mcp/issues)
 
 ## License
