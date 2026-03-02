@@ -2,7 +2,7 @@
 
 MCP server for the [Influencers Club API](https://app.theneo.io/influencers-club/influencers-public-api) — creator enrichment, discovery, batch operations, post data, and account management.
 
-## Installation // not done yet
+## Installation
 
 ```bash
 pip install influencers-club-mcp
@@ -97,7 +97,7 @@ The server calls `enrich_by_handle` and returns cross-platform presence, engagem
 
 **Example 3 — Find similar creators for campaign scaling:**
 
-> "I like the creator @example.com on YouTube. Find 10 similar creators with at least 100k followers."
+> "I like the creator @MrBeast on YouTube. Find 10 similar creators with at least 100k followers."
 
 The server calls `find_similar_creators` using the seed handle and returns a list of lookalike creators that match the content style and audience profile.
 
