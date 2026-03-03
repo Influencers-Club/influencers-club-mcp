@@ -15,6 +15,5 @@ COPY --from=builder /app/deps /app/deps
 COPY --from=builder /app/influencers_club_mcp /app/influencers_club_mcp
 
 ENV PYTHONPATH=/app/deps
-ENV INFLUENCERS_CLUB_API_KEY=""
 
 ENTRYPOINT ["python", "-m", "influencers_club_mcp"]

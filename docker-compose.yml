@@ -1,0 +1,6 @@
+services:
+  influencers-club-mcp:
+    build: .
+    stdin_open: true
+    environment:
+      - INFLUENCERS_CLUB_API_KEY=${INFLUENCERS_CLUB_API_KEY}
