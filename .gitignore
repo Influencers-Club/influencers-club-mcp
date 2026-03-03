@@ -7,3 +7,5 @@ build/
 .eggs/
 *.egg
 .env
+nul
+test_all_endpoints.py
