@@ -7,7 +7,9 @@ discovery, batch operations, post data, and account management.
 
 import os
 import json
-from typing import Any
+from typing import Annotated, Any, Literal
+
+from pydantic import Field
 
 import httpx
 from mcp.server.fastmcp import FastMCP
@@ -68,18 +70,18 @@ async def _api_post(path: str, body: dict[str, Any]) -> Any:
 
 @mcp.tool(annotations=ToolAnnotations(title="Discover Creators", readOnlyHint=True, destructiveHint=False))
 async def discover_creators(
-    platform: str,
-    limit: int = 10,
-    page: int = 0,
-    sort_by: str | None = None,
-    sort_order: str = "desc",
+    platform: Literal["instagram", "youtube", "tiktok", "twitch", "twitter", "onlyfans"],
+    limit: Annotated[int, Field(ge=1, le=100)] = 10,
+    page: Annotated[int, Field(ge=0)] = 0,
+    sort_by: Literal["relevancy", "followers", "engagement"] | None = None,
+    sort_order: Literal["asc", "desc"] = "desc",
     location: list[str] | None = None,
-    gender: str | None = None,
+    gender: Literal["male", "female"] | None = None,
     profile_language: list[str] | None = None,
-    min_followers: int | None = None,
-    max_followers: int | None = None,
-    min_engagement_percent: float | None = None,
-    max_engagement_percent: float | None = None,
+    min_followers: Annotated[int, Field(ge=0)] | None = None,
+    max_followers: Annotated[int, Field(ge=0)] | None = None,
+    min_engagement_percent: Annotated[float, Field(ge=0, le=100)] | None = None,
+    max_engagement_percent: Annotated[float, Field(ge=0, le=100)] | None = None,
     keywords_in_bio: list[str] | None = None,
     exclude_keywords_in_bio: list[str] | None = None,
     hashtags: list[str] | None = None,
@@ -176,13 +178,13 @@ async def discover_creators(
 
 @mcp.tool(annotations=ToolAnnotations(title="Find Similar Creators", readOnlyHint=True, destructiveHint=False))
 async def find_similar_creators(
-    platform: str,
-    filter_key: str,
+    platform: Literal["instagram", "youtube", "tiktok", "twitch", "twitter", "onlyfans"],
+    filter_key: Literal["url", "username", "id"],
     filter_value: str,
-    limit: int = 10,
-    page: int = 0,
-    min_followers: int | None = None,
-    max_followers: int | None = None,
+    limit: Annotated[int, Field(ge=1, le=100)] = 10,
+    page: Annotated[int, Field(ge=0)] = 0,
+    min_followers: Annotated[int, Field(ge=0)] | None = None,
+    max_followers: Annotated[int, Field(ge=0)] | None = None,
     location: list[str] | None = None,
     is_verified: bool | None = None,
     has_done_brand_deals: bool | None = None,
@@ -252,7 +254,7 @@ async def get_languages() -> str:
 
 
 @mcp.tool(annotations=ToolAnnotations(title="Get Locations", readOnlyHint=True, destructiveHint=False))
-async def get_locations(platform: str) -> str:
+async def get_locations(platform: Literal["instagram", "youtube", "tiktok", "twitch", "twitter", "onlyfans"]) -> str:
     """Fetch available locations for creator discovery filtering.
 
     Returns country and city options for location-based discovery.
@@ -334,8 +336,8 @@ async def enrich_by_email_advanced(
 @mcp.tool(annotations=ToolAnnotations(title="Enrich by Handle", readOnlyHint=True, destructiveHint=False))
 async def enrich_by_handle(
     handle: str,
-    platform: str,
-    email_required: str = "preferred",
+    platform: Literal["instagram", "youtube", "tiktok", "onlyfans", "twitter", "snapchat", "discord", "pinterest", "facebook", "linkedin", "twitch"],
+    email_required: Literal["must_have", "preferred"] = "preferred",
     include_lookalikes: bool = True,
     include_audience_data: bool = False,
 ) -> str:
@@ -366,7 +368,7 @@ async def enrich_by_handle(
 @mcp.tool(annotations=ToolAnnotations(title="Enrich by Handle (Raw)", readOnlyHint=True, destructiveHint=False))
 async def enrich_by_handle_raw(
     handle: str,
-    platform: str,
+    platform: Literal["instagram", "youtube", "tiktok", "onlyfans", "twitter", "snapchat", "discord", "pinterest", "facebook", "linkedin", "twitch"],
 ) -> str:
     """Get raw scraper data for a creator using their social media handle.
 
@@ -390,11 +392,11 @@ async def enrich_by_handle_raw(
 @mcp.tool(annotations=ToolAnnotations(title="Create Batch Enrichment", readOnlyHint=False, destructiveHint=False))
 async def create_batch_enrichment(
     csv_content: str,
-    enrichment_mode: str,
-    platform: str | None = None,
+    enrichment_mode: Literal["raw", "full", "basic", "advanced"],
+    platform: Literal["instagram", "youtube", "tiktok", "twitch", "twitter", "onlyfans"] | None = None,
     include_lookalikes: bool = True,
     include_audience_data: bool = False,
-    min_followers: int | None = None,
+    min_followers: Annotated[int, Field(ge=0)] | None = None,
 ) -> str:
     """Submit a batch enrichment job for a list of creators.
 
@@ -493,9 +495,9 @@ async def resume_batch(batch_id: str) -> str:
 
 @mcp.tool(annotations=ToolAnnotations(title="Get Post Details", readOnlyHint=True, destructiveHint=False))
 async def get_post_details(
-    platform: str,
+    platform: Literal["instagram", "tiktok", "youtube"],
     post_id: str,
-    content_type: str = "data",
+    content_type: Literal["data", "comments", "transcript", "audio"] = "data",
     pagination_token: str | None = None,
 ) -> str:
     """Retrieve detailed data for a specific social media post.
