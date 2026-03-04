@@ -1,6 +1,8 @@
 # Influencers Club MCP Server
 
-MCP server for the [Influencers Club API](https://app.theneo.io/influencers-club/influencers-public-api) — creator enrichment, discovery, batch operations, post data, and account management.
+> **Beta** — This project is under active development. It works and can be tested, but expect changes before the stable release.
+
+MCP server for the [Influencers Club API](https://docs.influencers.club/) — creator enrichment, discovery, audience analysis, content data, batch operations, and account management.
 
 ## Prerequisites
 
@@ -86,7 +88,15 @@ Add to `.vscode/mcp.json` in your project:
 
 After configuring, restart your client. The server will appear as "influencers-club".
 
-## Available Tools
+## Available Tools (24)
+
+### Creator Discovery
+
+| Tool | Description | Cost |
+|---|---|---|
+| `discover_creators` | Search creators with filters (followers, engagement, location, etc.) | 0.01/creator |
+| `find_similar_creators` | Find creators similar to a seed creator | 0.01/creator |
+| `audience_overlap` | Compare audience overlap between 2-10 creators | 1 credit |
 
 ### Enrichment
 
@@ -95,18 +105,15 @@ After configuring, restart your client. The server will appear as "influencers-c
 | `enrich_by_email_basic` | Basic creator lookup by email | 0.1 credits |
 | `enrich_by_email_advanced` | Advanced multi-platform lookup by email | 2 credits |
 | `enrich_by_handle` | Full enriched profile with lookalikes & audience | 1 credit |
-| `enrich_by_handle_raw` | Raw scraper data by handle + platform | varies |
+| `enrich_by_handle_raw` | Raw scraper data by handle + platform | 0.03 credits |
+| `connected_socials` | Discover verified linked social accounts | 0.5 credits |
 
-### Creator Discovery
+### Content Data
 
 | Tool | Description | Cost |
 |---|---|---|
-| `discover_creators` | Search creators with filters (followers, engagement, location, etc.) | 0.01/creator |
-| `find_similar_creators` | Find creators similar to a seed creator | 0.01/creator |
-| `get_languages` | Available languages for filtering | free |
-| `get_locations` | Available locations per platform | free |
-| `get_youtube_topics` | Available YouTube topics for filtering | free |
-| `get_twitch_games` | Available Twitch games for filtering | free |
+| `get_creator_posts` | Fetch recent posts with engagement metrics | 0.03 credits |
+| `get_post_details` | Deep content analysis (comments, transcript, audio) | 0.03 credits |
 
 ### Batch Enrichment
 
@@ -114,14 +121,27 @@ After configuring, restart your client. The server will appear as "influencers-c
 |---|---|---|
 | `create_batch_enrichment` | Upload CSV for batch processing | varies |
 | `get_batch_status` | Check batch job progress | free |
-| `get_batch_results` | Download completed batch CSV | free |
+| `get_batch_results` | Download completed batch (CSV or JSON) | free |
 | `resume_batch` | Resume a paused batch | free |
 
-### Post Data & Account
+### Discovery Reference Data
 
 | Tool | Description | Cost |
 |---|---|---|
-| `get_post_details` | Detailed data for a specific post | 0.03 credits |
+| `get_languages` | Available languages for filtering | free |
+| `get_locations` | Available locations per platform | free |
+| `get_brands` | Available brand identifiers | free |
+| `get_youtube_topics` | Available YouTube topics | free |
+| `get_twitch_games` | Available Twitch games | free |
+| `get_audience_brand_categories` | Audience brand categories | free |
+| `get_audience_brand_names` | Audience brand names | free |
+| `get_audience_interests` | Audience interest categories | free |
+| `get_audience_locations` | Audience geographic locations | free |
+
+### Account
+
+| Tool | Description | Cost |
+|---|---|---|
 | `check_credits` | Check account credits balance | free |
 
 ## Usage Examples
@@ -138,6 +158,18 @@ After configuring, restart your client. The server will appear as "influencers-c
 
 > "I like the creator @MrBeast on YouTube. Find 10 similar creators with at least 100k followers."
 
+**Compare audience overlap:**
+
+> "Compare the audience overlap between @nike, @adidas, and @puma on Instagram."
+
+**Get a creator's recent posts:**
+
+> "Show me the latest posts from @garyvee on TikTok with engagement metrics."
+
+**Find all connected social accounts:**
+
+> "What other social media accounts does @cristiano have linked to their Instagram?"
+
 **Check your remaining API credits:**
 
 > "How many credits do I have left?"
@@ -148,7 +180,8 @@ After configuring, restart your client. The server will appear as "influencers-c
 |---|---|
 | Enrichment | Instagram, TikTok, YouTube, OnlyFans, X/Twitter, Twitch, Facebook, Pinterest, Discord, Snapchat, LinkedIn |
 | Discovery | Instagram, TikTok, YouTube, OnlyFans, X/Twitter, Twitch |
-| Post Data | Instagram, TikTok, YouTube |
+| Content Data | Instagram, TikTok, YouTube |
+| Audience Overlap | Instagram, TikTok, YouTube |
 
 ## Privacy Policy
 

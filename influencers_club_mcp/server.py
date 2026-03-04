@@ -2,7 +2,7 @@
 Influencers Club MCP Server
 
 MCP server exposing the Influencers Club public API for creator enrichment,
-discovery, batch operations, post data, and account management.
+discovery, batch operations, content data, and account management.
 """
 
 import os
@@ -19,7 +19,7 @@ BASE_URL = "https://api-dashboard.influencers.club"
 
 mcp = FastMCP(
     "influencers-club",
-    instructions="MCP server for the Influencers Club API - creator enrichment, discovery, and batch operations",
+    instructions="MCP server for the Influencers Club API - creator enrichment, discovery, content, and batch operations",
 )
 
 
@@ -41,9 +41,9 @@ def _headers() -> dict[str, str]:
     }
 
 
-async def _api_get(path: str) -> Any:
+async def _api_get(path: str, params: dict[str, Any] | None = None) -> Any:
     async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.get(f"{BASE_URL}{path}", headers=_headers())
+        resp = await client.get(f"{BASE_URL}{path}", headers=_headers(), params=params)
         if resp.status_code >= 400:
             try:
                 err = resp.json()
@@ -239,6 +239,28 @@ async def find_similar_creators(
     return json.dumps(result, indent=2)
 
 
+@mcp.tool(annotations=ToolAnnotations(title="Audience Overlap", readOnlyHint=True, destructiveHint=False))
+async def audience_overlap(
+    platform: Literal["instagram", "tiktok", "youtube"],
+    creators: list[str],
+) -> str:
+    """Compare audience overlap between 2-10 creators on a given platform.
+
+    Returns per-creator overlap percentages, unique audience data, and total followers.
+    Useful for campaign planning to avoid audience duplication.
+    Credits: 1 per request.
+
+    Args:
+        platform: Platform to compare on (instagram, tiktok, youtube).
+        creators: List of 2-10 creator usernames or URLs to compare.
+    """
+    result = await _api_post("/public/v1/creators/audience/overlap/", {
+        "platform": platform,
+        "creators": creators,
+    })
+    return json.dumps(result, indent=2)
+
+
 # ─── Discovery Reference Data ────────────────────────────────────────────────
 
 
@@ -267,6 +289,17 @@ async def get_locations(platform: Literal["instagram", "youtube", "tiktok", "twi
     return json.dumps(result, indent=2)
 
 
+@mcp.tool(annotations=ToolAnnotations(title="Get Brands", readOnlyHint=True, destructiveHint=False))
+async def get_brands() -> str:
+    """Fetch available brand identifiers for creator discovery filtering.
+
+    Returns list of brands that can be used to filter creators by brand partnerships.
+    No credits consumed.
+    """
+    result = await _api_get("/public/v1/discovery/classifier/brands/")
+    return json.dumps(result, indent=2)
+
+
 @mcp.tool(annotations=ToolAnnotations(title="Get YouTube Topics", readOnlyHint=True, destructiveHint=False))
 async def get_youtube_topics() -> str:
     """Fetch available YouTube topics for creator discovery filtering.
@@ -286,6 +319,98 @@ async def get_twitch_games() -> str:
     No credits consumed.
     """
     result = await _api_get("/public/v1/discovery/classifier/games/")
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool(annotations=ToolAnnotations(title="Get Audience Brand Categories", readOnlyHint=True, destructiveHint=False))
+async def get_audience_brand_categories(
+    search: str | None = None,
+    offset: Annotated[int, Field(ge=0)] | None = None,
+) -> str:
+    """Fetch available audience brand categories for discovery filtering.
+
+    Returns brand categories that can be used to filter creators by their audience's brand affinities.
+    No credits consumed.
+
+    Args:
+        search: Optional search string to filter results.
+        offset: Optional pagination offset.
+    """
+    params: dict[str, Any] = {}
+    if search:
+        params["search"] = search
+    if offset is not None:
+        params["offset"] = offset
+    result = await _api_get("/public/v1/discovery/classifier/audience-brand-categories/", params or None)
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool(annotations=ToolAnnotations(title="Get Audience Brand Names", readOnlyHint=True, destructiveHint=False))
+async def get_audience_brand_names(
+    search: str | None = None,
+    offset: Annotated[int, Field(ge=0)] | None = None,
+) -> str:
+    """Fetch available audience brand names for discovery filtering.
+
+    Returns brand names that can be used to filter creators by their audience's brand preferences.
+    No credits consumed.
+
+    Args:
+        search: Optional search string to filter results.
+        offset: Optional pagination offset.
+    """
+    params: dict[str, Any] = {}
+    if search:
+        params["search"] = search
+    if offset is not None:
+        params["offset"] = offset
+    result = await _api_get("/public/v1/discovery/classifier/audience-brand-names/", params or None)
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool(annotations=ToolAnnotations(title="Get Audience Interests", readOnlyHint=True, destructiveHint=False))
+async def get_audience_interests(
+    search: str | None = None,
+    offset: Annotated[int, Field(ge=0)] | None = None,
+) -> str:
+    """Fetch available audience interests for discovery filtering.
+
+    Returns interest categories that can be used to filter creators by their audience's interests.
+    No credits consumed.
+
+    Args:
+        search: Optional search string to filter results.
+        offset: Optional pagination offset.
+    """
+    params: dict[str, Any] = {}
+    if search:
+        params["search"] = search
+    if offset is not None:
+        params["offset"] = offset
+    result = await _api_get("/public/v1/discovery/classifier/audience-interests/", params or None)
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool(annotations=ToolAnnotations(title="Get Audience Locations", readOnlyHint=True, destructiveHint=False))
+async def get_audience_locations(
+    search: str | None = None,
+    offset: Annotated[int, Field(ge=0)] | None = None,
+) -> str:
+    """Fetch available audience locations for discovery filtering.
+
+    Returns location options that can be used to filter creators by their audience's geographic distribution.
+    No credits consumed.
+
+    Args:
+        search: Optional search string to filter results.
+        offset: Optional pagination offset.
+    """
+    params: dict[str, Any] = {}
+    if search:
+        params["search"] = search
+    if offset is not None:
+        params["offset"] = offset
+    result = await _api_get("/public/v1/discovery/classifier/audience-locations/", params or None)
     return json.dumps(result, indent=2)
 
 
@@ -373,13 +498,35 @@ async def enrich_by_handle_raw(
     """Get raw scraper data for a creator using their social media handle.
 
     Returns unprocessed scraper data directly from the platform. Cheaper than full enrichment.
-    Credits vary by platform.
+    Credits: 0.03 per request.
 
     Args:
         handle: The creator's handle/username (without @ symbol).
         platform: Platform (instagram, youtube, tiktok, onlyfans, twitter, snapchat, discord, pinterest, facebook, linkedin, twitch).
     """
     result = await _api_post("/public/v1/creators/enrich/handle/raw/", {
+        "handle": handle.lstrip("@"),
+        "platform": platform,
+    })
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool(annotations=ToolAnnotations(title="Connected Socials", readOnlyHint=True, destructiveHint=False))
+async def connected_socials(
+    handle: str,
+    platform: Literal["instagram", "youtube", "tiktok", "onlyfans", "twitter", "snapchat", "discord", "pinterest", "facebook", "linkedin", "twitch"],
+) -> str:
+    """Discover verified social accounts linked to a creator across platforms.
+
+    Returns an array of connected accounts with platform, username, and follower count.
+    Useful for finding a creator's full social presence from a single handle.
+    Credits: 0.5 per successful request.
+
+    Args:
+        handle: The creator's handle/username (without @ symbol).
+        platform: Seed platform (instagram, youtube, tiktok, onlyfans, twitter, snapchat, discord, pinterest, facebook, linkedin, twitch).
+    """
+    result = await _api_post("/public/v1/creators/socials/", {
         "handle": handle.lstrip("@"),
         "platform": platform,
     })
@@ -394,8 +541,10 @@ async def create_batch_enrichment(
     csv_content: str,
     enrichment_mode: Literal["raw", "full", "basic", "advanced"],
     platform: Literal["instagram", "youtube", "tiktok", "twitch", "twitter", "onlyfans"] | None = None,
-    include_lookalikes: bool = True,
+    include_lookalikes: bool = False,
     include_audience_data: bool = False,
+    email_required: Literal["must_have", "preferred"] | None = None,
+    exclude_platforms: str | None = None,
     min_followers: Annotated[int, Field(ge=0)] | None = None,
 ) -> str:
     """Submit a batch enrichment job for a list of creators.
@@ -408,8 +557,10 @@ async def create_batch_enrichment(
         csv_content: CSV as a string. First line must be 'handle' or 'email' header.
         enrichment_mode: One of "raw", "full", "basic", "advanced".
         platform: Required for handle-based batches. Omit for email-based.
-        include_lookalikes: Include lookalike recommendations (default True).
+        include_lookalikes: Include lookalike recommendations (default False).
         include_audience_data: Include audience demographics (default False).
+        email_required: "must_have" or "preferred" for handle-based enrichment.
+        exclude_platforms: Comma-separated platforms to exclude for email-based enrichment.
         min_followers: Minimum follower threshold.
     """
     async with httpx.AsyncClient(timeout=60) as client:
@@ -421,6 +572,10 @@ async def create_batch_enrichment(
         }
         if platform:
             data["platform"] = platform
+        if email_required:
+            data["email_required"] = email_required
+        if exclude_platforms:
+            data["exclude_platforms"] = exclude_platforms
         if min_followers is not None:
             data["min_followers"] = str(min_followers)
         resp = await client.post(
@@ -442,7 +597,7 @@ async def create_batch_enrichment(
 async def get_batch_status(batch_id: str) -> str:
     """Check the status of a batch enrichment job.
 
-    Returns status: 'processing', 'validating', 'finished', or 'failed'.
+    Returns status, total/processed/success/failed row counts, credits used, and estimated completion.
     No credits consumed.
 
     Args:
@@ -453,19 +608,24 @@ async def get_batch_status(batch_id: str) -> str:
 
 
 @mcp.tool(annotations=ToolAnnotations(title="Get Batch Results", readOnlyHint=True, destructiveHint=False))
-async def get_batch_results(batch_id: str) -> str:
-    """Download results of a finished batch enrichment job as CSV.
+async def get_batch_results(
+    batch_id: str,
+    format: Literal["csv", "json"] = "csv",
+) -> str:
+    """Download results of a finished batch enrichment job.
 
     Only call after get_batch_status returns 'finished'.
     No credits consumed for download.
 
     Args:
         batch_id: The batch_id returned by create_batch_enrichment.
+        format: Output format - "csv" (default) or "json".
     """
     async with httpx.AsyncClient(timeout=60) as client:
         resp = await client.get(
             f"{BASE_URL}/public/v1/enrichment/batch/{batch_id}/",
             headers={"Authorization": _auth_header()},
+            params={"format": format},
         )
         if resp.status_code >= 400:
             try:
@@ -473,6 +633,8 @@ async def get_batch_results(batch_id: str) -> str:
             except Exception:
                 err = resp.text
             return json.dumps({"error": err, "status_code": resp.status_code}, indent=2)
+        if format == "json":
+            return json.dumps(resp.json(), indent=2)
         return resp.text
 
 
@@ -490,7 +652,39 @@ async def resume_batch(batch_id: str) -> str:
     return json.dumps(result, indent=2)
 
 
-# ─── Post Data ─────────────────────────────────────────────────────────────────
+# ─── Content Data ──────────────────────────────────────────────────────────────
+
+
+@mcp.tool(annotations=ToolAnnotations(title="Get Creator Posts", readOnlyHint=True, destructiveHint=False))
+async def get_creator_posts(
+    platform: Literal["instagram", "tiktok", "youtube"],
+    handle: str,
+    count: Annotated[int, Field(ge=1, le=50)] | None = None,
+    pagination_token: str | None = None,
+) -> str:
+    """Fetch recent posts for a creator with engagement metrics.
+
+    Returns posts with ID, URL, caption, media URLs, timestamps, and engagement data.
+    Supports cursor-based pagination via next_token.
+    Page sizes: Instagram (12 fixed), TikTok (default 30, max 35), YouTube (default 30, max 50).
+    Credits: 0.03 per request.
+
+    Args:
+        platform: Platform to fetch posts from (instagram, tiktok, youtube).
+        handle: The creator's handle/username or profile URL.
+        count: Number of posts per page (platform-specific limits apply).
+        pagination_token: Cursor token from previous response for next page.
+    """
+    body: dict[str, Any] = {
+        "platform": platform,
+        "handle": handle.lstrip("@"),
+    }
+    if count is not None:
+        body["count"] = count
+    if pagination_token:
+        body["pagination_token"] = pagination_token
+    result = await _api_post("/public/v1/creators/content/posts/", body)
+    return json.dumps(result, indent=2)
 
 
 @mcp.tool(annotations=ToolAnnotations(title="Get Post Details", readOnlyHint=True, destructiveHint=False))
