@@ -7,7 +7,7 @@ MCP server for the [Influencers Club API](https://docs.influencers.club/) — cr
 ## Prerequisites
 
 - Python 3.10+
-- An [Influencers Club API key](https://api-dashboard.influencers.club)
+- An [Influencers Club API key](https://docs.influencers.club/#authentication)
 
 ## Installation
 
@@ -185,7 +185,7 @@ After configuring, restart your client. The server will appear as "influencers-c
 
 ## Privacy Policy
 
-This MCP server acts as a pass-through to the [Influencers Club API](https://api-dashboard.influencers.club). It does not collect, store, or log any user data, conversation data, or API responses. All data flows directly between Claude and the Influencers Club API using your personal API key. For the Influencers Club data and privacy practices, refer to the [Influencers Club Privacy Policy](https://influencers.club/privacy-policy).
+This MCP server acts as a pass-through to the [Influencers Club API](https://docs.influencers.club/). It does not collect, store, or log any user data, conversation data, or API responses. All data flows directly between Claude and the Influencers Club API using your personal API key. For the Influencers Club data and privacy practices, refer to the [Influencers Club Privacy Policy](https://influencers.club/privacy-policy).
 
 ## Support
 
