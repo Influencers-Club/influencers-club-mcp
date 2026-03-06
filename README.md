@@ -14,7 +14,7 @@ MCP server for the [Influencers Club API](https://docs.influencers.club/) — cr
 ### pip (recommended)
 
 ```bash
-pip install influencers-club-mcp
+pip install .
 ```
 
 ### From source
