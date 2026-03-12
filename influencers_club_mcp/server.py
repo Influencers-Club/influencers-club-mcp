@@ -6,6 +6,8 @@ discovery, batch operations, content data, and account management.
 """
 
 import os
+import re
+import sys
 import json
 from typing import Annotated, Any, Literal
 
@@ -19,7 +21,20 @@ BASE_URL = "https://api-dashboard.influencers.club"
 
 mcp = FastMCP(
     "influencers-club",
-    instructions="MCP server for the Influencers Club API - creator enrichment, discovery, content, and batch operations",
+    instructions=(
+        "MCP server for the Influencers Club API - creator enrichment, discovery, content, and batch operations.\n\n"
+        "IMPORTANT: Do NOT guess or invent parameter names. If a tool's schema has not been loaded yet, "
+        "use tool_search to load the correct parameter names BEFORE calling the tool. "
+        "Never fabricate parameters like 'niche', 'max_results', or 'query' — they do not exist. "
+        "Always use the exact parameter names from the loaded tool schema.\n\n"
+        "Key tools:\n"
+        "- discover_creators: Use 'ai_search' for niche/topic queries (e.g. 'retro videogames'). "
+        "Pass the user's exact words as-is — do NOT add synonyms, expand, or rephrase the query. "
+        "Only use 'hashtags' or 'keywords_in_bio' when the user explicitly specifies them.\n"
+        "- enrich_by_email: Use for email lookups. Parameter is 'email'. Use tier='basic' (default) or tier='advanced'.\n"
+        "- enrich_by_handle: Use for handle lookups. Parameters are 'handle' and 'platform'.\n"
+        "- manage_batch: Use action='status' to check, action='results' to download, action='resume' to restart."
+    ),
 )
 
 
@@ -41,26 +56,93 @@ def _headers() -> dict[str, str]:
     }
 
 
+# ─── Input Validation ─────────────────────────────────────────────────────────
+
+_SAFE_PATH_RE = re.compile(r"^[a-zA-Z0-9_\-]+$")
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+MAX_CSV_BYTES = 10 * 1024 * 1024
+MAX_CSV_ROWS = 10_000
+
+DISCOVERY_PLATFORMS = {"instagram", "youtube", "tiktok", "twitch", "twitter", "onlyfans"}
+ENRICH_PLATFORMS = {"instagram", "youtube", "tiktok", "onlyfans", "twitter", "snapchat", "discord", "pinterest", "facebook", "linkedin", "twitch"}
+CONTENT_PLATFORMS = {"instagram", "tiktok", "youtube"}
+OVERLAP_PLATFORMS = {"instagram", "tiktok", "youtube"}
+
+
+def _validate_handle(value: str) -> str:
+    cleaned = value.lstrip("@").strip()
+    if not cleaned or len(cleaned) > 500:
+        return ""
+    if "\x00" in cleaned or "\n" in cleaned:
+        return ""
+    return cleaned
+
+
+def _validate_email(value: str) -> str:
+    value = value.strip()
+    if not value or len(value) > 320 or not _EMAIL_RE.match(value):
+        return ""
+    return value
+
+
+def _validate_path_param(value: str) -> str:
+    if not value or not _SAFE_PATH_RE.match(value):
+        return ""
+    return value
+
+
+def _validate_csv(content: str) -> str | None:
+    """Returns error message or None if valid."""
+    if len(content.encode()) > MAX_CSV_BYTES:
+        return "CSV exceeds 10 MB limit"
+    if "\x00" in content:
+        return "CSV contains binary/null bytes"
+    lines = content.strip().splitlines()
+    if not lines:
+        return "CSV is empty"
+    header = lines[0].strip().lower()
+    if header not in ("handle", "email"):
+        return "CSV header must be 'handle' or 'email'"
+    if len(lines) - 1 > MAX_CSV_ROWS:
+        return f"CSV exceeds {MAX_CSV_ROWS} row limit"
+    return None
+
+
+def _sanitize_error(err: Any) -> Any:
+    if isinstance(err, str):
+        return re.sub(r"Bearer\s+\S+", "Bearer [REDACTED]", err)
+    if isinstance(err, dict):
+        return {k: _sanitize_error(v) for k, v in err.items()}
+    return err
+
+
+# ─── API Helpers ──────────────────────────────────────────────────────────────
+
+
 async def _api_get(path: str, params: dict[str, Any] | None = None) -> Any:
+    print(f"[MCP] GET {path} params={params}", file=sys.stderr)
     async with httpx.AsyncClient(timeout=30) as client:
         resp = await client.get(f"{BASE_URL}{path}", headers=_headers(), params=params)
+        print(f"[MCP] GET {path} → {resp.status_code}", file=sys.stderr)
         if resp.status_code >= 400:
             try:
-                err = resp.json()
+                err = _sanitize_error(resp.json())
             except Exception:
-                err = resp.text
+                err = _sanitize_error(resp.text)
             return {"error": err, "status_code": resp.status_code}
         return resp.json()
 
 
 async def _api_post(path: str, body: dict[str, Any]) -> Any:
+    print(f"[MCP] POST {path} body={json.dumps(body, default=str)[:500]}", file=sys.stderr)
     async with httpx.AsyncClient(timeout=30) as client:
         resp = await client.post(f"{BASE_URL}{path}", headers=_headers(), json=body)
+        print(f"[MCP] POST {path} → {resp.status_code}", file=sys.stderr)
         if resp.status_code >= 400:
             try:
-                err = resp.json()
+                err = _sanitize_error(resp.json())
             except Exception:
-                err = resp.text
+                err = _sanitize_error(resp.text)
             return {"error": err, "status_code": resp.status_code}
         return resp.json()
 
@@ -73,6 +155,7 @@ async def discover_creators(
     platform: Literal["instagram", "youtube", "tiktok", "twitch", "twitter", "onlyfans"],
     limit: Annotated[int, Field(ge=1, le=100)] = 10,
     page: Annotated[int, Field(ge=0)] = 0,
+    ai_search: str | None = None,
     sort_by: Literal["relevancy", "followers", "engagement"] | None = None,
     sort_order: Literal["asc", "desc"] = "desc",
     location: list[str] | None = None,
@@ -94,6 +177,9 @@ async def discover_creators(
 ) -> str:
     """Search and filter the influencers.club creator database.
 
+    Use ai_search for niche/topic queries (e.g. "retro videogames", "vegan cooking").
+    Only use hashtags or keywords_in_bio when the user explicitly specifies them.
+
     Platforms: instagram, youtube, tiktok, twitch, twitter, onlyfans.
     Returns paginated list of creator profiles with follower counts and engagement rates.
     Credits: 0.01 per creator returned. No charge if 0 results.
@@ -102,6 +188,7 @@ async def discover_creators(
         platform: Platform to search on (instagram, youtube, tiktok, twitch, twitter, onlyfans).
         limit: Number of results per page (1-100, default 10).
         page: Page number (0-indexed, default 0).
+        ai_search: Natural language search for niche/topic-based discovery. Use this for ANY topic or niche query. The API uses AI to find matching creators. Pass the user's exact words — do not add synonyms or rephrase.
         sort_by: Sort results by "relevancy", "followers", or "engagement".
         sort_order: Sort direction "asc" or "desc" (default "desc").
         location: Filter by location codes.
@@ -121,6 +208,14 @@ async def discover_creators(
         exclude_private_profile: Exclude private profiles (default True).
         last_post: Filter by recency of last post e.g. "30d", "90d".
     """
+    # Pre-flight checks
+    if platform not in DISCOVERY_PLATFORMS:
+        return f"Error: invalid platform '{platform}'. Must be one of: {', '.join(sorted(DISCOVERY_PLATFORMS))}."
+    if not 1 <= limit <= 100:
+        return "Error: limit must be between 1 and 100."
+    if page < 0:
+        return "Error: page must be 0 or greater."
+
     body: dict[str, Any] = {
         "platform": platform,
         "paging": {"limit": limit, "page": page},
@@ -168,6 +263,8 @@ async def discover_creators(
         filters["exclude_private_profile"] = exclude_private_profile
     if last_post:
         filters["last_post"] = last_post
+    if ai_search:
+        filters["ai_search"] = ai_search
 
     if filters:
         body["filters"] = filters
@@ -208,10 +305,20 @@ async def find_similar_creators(
         has_done_brand_deals: Filter to creators with brand deals.
         keywords_in_bio: Filter by keywords in bio.
     """
+    # Pre-flight checks
+    if platform not in DISCOVERY_PLATFORMS:
+        return f"Error: invalid platform '{platform}'. Must be one of: {', '.join(sorted(DISCOVERY_PLATFORMS))}."
+    if filter_key not in ("url", "username", "id"):
+        return "Error: filter_key must be 'url', 'username', or 'id'."
+    if not filter_value or not filter_value.strip():
+        return "Error: filter_value is required. Please provide a username, URL, or platform ID."
+    if not 1 <= limit <= 100:
+        return "Error: limit must be between 1 and 100."
+
     body: dict[str, Any] = {
         "platform": platform,
         "filter_key": filter_key,
-        "filter_value": filter_value,
+        "filter_value": filter_value.lstrip("@").strip(),
         "paging": {"limit": limit, "page": page},
     }
 
@@ -254,6 +361,15 @@ async def audience_overlap(
         platform: Platform to compare on (instagram, tiktok, youtube).
         creators: List of 2-10 creator usernames or URLs to compare.
     """
+    # Pre-flight checks
+    if platform not in OVERLAP_PLATFORMS:
+        return f"Error: invalid platform '{platform}'. Audience overlap supports: {', '.join(sorted(OVERLAP_PLATFORMS))}."
+    creators = [c.lstrip("@").strip() for c in creators if c and c.strip()]
+    if len(creators) < 2:
+        return "Error: audience_overlap requires at least 2 creator usernames. Please provide 2-10 creators."
+    if len(creators) > 10:
+        return "Error: audience_overlap supports a maximum of 10 creators."
+
     result = await _api_post("/public/v1/creators/audience/overlap/", {
         "platform": platform,
         "creators": creators,
@@ -263,198 +379,93 @@ async def audience_overlap(
 
 # ─── Discovery Reference Data ────────────────────────────────────────────────
 
-
-@mcp.tool(annotations=ToolAnnotations(title="Get Languages", readOnlyHint=True, destructiveHint=False))
-async def get_languages() -> str:
-    """Fetch available languages for creator discovery filtering.
-
-    Returns ISO 639-1 language codes supported by the discovery API.
-    No credits consumed.
-    """
-    result = await _api_get("/public/v1/discovery/classifier/languages/")
-    return json.dumps(result, indent=2)
-
-
-@mcp.tool(annotations=ToolAnnotations(title="Get Locations", readOnlyHint=True, destructiveHint=False))
-async def get_locations(platform: Literal["instagram", "youtube", "tiktok", "twitch", "twitter", "onlyfans"]) -> str:
-    """Fetch available locations for creator discovery filtering.
-
-    Returns country and city options for location-based discovery.
-    No credits consumed.
-
-    Args:
-        platform: Platform to get locations for (instagram, youtube, tiktok, twitch, twitter, onlyfans).
-    """
-    result = await _api_get(f"/public/v1/discovery/classifier/locations/{platform}/")
-    return json.dumps(result, indent=2)
+_CLASSIFIER_ENDPOINTS = {
+    "languages": "/public/v1/discovery/classifier/languages/",
+    "brands": "/public/v1/discovery/classifier/brands/",
+    "youtube_topics": "/public/v1/discovery/classifier/yt-topics/",
+    "twitch_games": "/public/v1/discovery/classifier/games/",
+    "audience_brand_categories": "/public/v1/discovery/classifier/audience-brand-categories/",
+    "audience_brand_names": "/public/v1/discovery/classifier/audience-brand-names/",
+    "audience_interests": "/public/v1/discovery/classifier/audience-interests/",
+    "audience_locations": "/public/v1/discovery/classifier/audience-locations/",
+}
 
 
-@mcp.tool(annotations=ToolAnnotations(title="Get Brands", readOnlyHint=True, destructiveHint=False))
-async def get_brands() -> str:
-    """Fetch available brand identifiers for creator discovery filtering.
-
-    Returns list of brands that can be used to filter creators by brand partnerships.
-    No credits consumed.
-    """
-    result = await _api_get("/public/v1/discovery/classifier/brands/")
-    return json.dumps(result, indent=2)
-
-
-@mcp.tool(annotations=ToolAnnotations(title="Get YouTube Topics", readOnlyHint=True, destructiveHint=False))
-async def get_youtube_topics() -> str:
-    """Fetch available YouTube topics for creator discovery filtering.
-
-    Returns list of supported YouTube topic categories.
-    No credits consumed.
-    """
-    result = await _api_get("/public/v1/discovery/classifier/yt-topics/")
-    return json.dumps(result, indent=2)
-
-
-@mcp.tool(annotations=ToolAnnotations(title="Get Twitch Games", readOnlyHint=True, destructiveHint=False))
-async def get_twitch_games() -> str:
-    """Fetch available Twitch games for creator discovery filtering.
-
-    Returns list of supported Twitch games.
-    No credits consumed.
-    """
-    result = await _api_get("/public/v1/discovery/classifier/games/")
-    return json.dumps(result, indent=2)
-
-
-@mcp.tool(annotations=ToolAnnotations(title="Get Audience Brand Categories", readOnlyHint=True, destructiveHint=False))
-async def get_audience_brand_categories(
+@mcp.tool(annotations=ToolAnnotations(title="Get Discovery Options", readOnlyHint=True, destructiveHint=False))
+async def get_discovery_options(
+    data_type: Literal["languages", "locations", "brands", "youtube_topics", "twitch_games", "audience_brand_categories", "audience_brand_names", "audience_interests", "audience_locations"],
+    platform: Literal["instagram", "youtube", "tiktok", "twitch", "twitter", "onlyfans"] | None = None,
     search: str | None = None,
     offset: Annotated[int, Field(ge=0)] | None = None,
 ) -> str:
-    """Fetch available audience brand categories for discovery filtering.
+    """Fetch available filter options for creator discovery.
 
-    Returns brand categories that can be used to filter creators by their audience's brand affinities.
-    No credits consumed.
-
-    Args:
-        search: Optional search string to filter results.
-        offset: Optional pagination offset.
-    """
-    params: dict[str, Any] = {}
-    if search:
-        params["search"] = search
-    if offset is not None:
-        params["offset"] = offset
-    result = await _api_get("/public/v1/discovery/classifier/audience-brand-categories/", params or None)
-    return json.dumps(result, indent=2)
-
-
-@mcp.tool(annotations=ToolAnnotations(title="Get Audience Brand Names", readOnlyHint=True, destructiveHint=False))
-async def get_audience_brand_names(
-    search: str | None = None,
-    offset: Annotated[int, Field(ge=0)] | None = None,
-) -> str:
-    """Fetch available audience brand names for discovery filtering.
-
-    Returns brand names that can be used to filter creators by their audience's brand preferences.
-    No credits consumed.
+    Returns reference data (languages, locations, brands, topics, audience filters) used
+    as filter values in discover_creators. No credits consumed.
 
     Args:
-        search: Optional search string to filter results.
-        offset: Optional pagination offset.
+        data_type: Type of reference data to fetch.
+        platform: Required only for "locations". Platform to get locations for.
+        search: Optional search string (only for audience_* types).
+        offset: Optional pagination offset (only for audience_* types).
     """
+    if data_type == "locations":
+        if not platform:
+            return "Error: platform is required for locations. Please specify instagram, youtube, tiktok, etc."
+        if platform not in DISCOVERY_PLATFORMS:
+            return f"Error: invalid platform '{platform}'. Must be one of: {', '.join(sorted(DISCOVERY_PLATFORMS))}."
+        result = await _api_get(f"/public/v1/discovery/classifier/locations/{platform}/")
+        return json.dumps(result, indent=2)
+
+    endpoint = _CLASSIFIER_ENDPOINTS.get(data_type)
+    if not endpoint:
+        return f"Error: invalid data_type '{data_type}'."
+
     params: dict[str, Any] = {}
-    if search:
+    if search and data_type.startswith("audience_"):
         params["search"] = search
-    if offset is not None:
+    if offset is not None and data_type.startswith("audience_"):
         params["offset"] = offset
-    result = await _api_get("/public/v1/discovery/classifier/audience-brand-names/", params or None)
-    return json.dumps(result, indent=2)
 
-
-@mcp.tool(annotations=ToolAnnotations(title="Get Audience Interests", readOnlyHint=True, destructiveHint=False))
-async def get_audience_interests(
-    search: str | None = None,
-    offset: Annotated[int, Field(ge=0)] | None = None,
-) -> str:
-    """Fetch available audience interests for discovery filtering.
-
-    Returns interest categories that can be used to filter creators by their audience's interests.
-    No credits consumed.
-
-    Args:
-        search: Optional search string to filter results.
-        offset: Optional pagination offset.
-    """
-    params: dict[str, Any] = {}
-    if search:
-        params["search"] = search
-    if offset is not None:
-        params["offset"] = offset
-    result = await _api_get("/public/v1/discovery/classifier/audience-interests/", params or None)
-    return json.dumps(result, indent=2)
-
-
-@mcp.tool(annotations=ToolAnnotations(title="Get Audience Locations", readOnlyHint=True, destructiveHint=False))
-async def get_audience_locations(
-    search: str | None = None,
-    offset: Annotated[int, Field(ge=0)] | None = None,
-) -> str:
-    """Fetch available audience locations for discovery filtering.
-
-    Returns location options that can be used to filter creators by their audience's geographic distribution.
-    No credits consumed.
-
-    Args:
-        search: Optional search string to filter results.
-        offset: Optional pagination offset.
-    """
-    params: dict[str, Any] = {}
-    if search:
-        params["search"] = search
-    if offset is not None:
-        params["offset"] = offset
-    result = await _api_get("/public/v1/discovery/classifier/audience-locations/", params or None)
+    result = await _api_get(endpoint, params or None)
     return json.dumps(result, indent=2)
 
 
 # ─── Enrichment ───────────────────────────────────────────────────────────────
 
 
-@mcp.tool(annotations=ToolAnnotations(title="Enrich by Email (Basic)", readOnlyHint=True, destructiveHint=False))
-async def enrich_by_email_basic(email: str) -> str:
-    """Look up a creator's social profiles using their email address (basic tier).
-
-    Returns essential profile info: social presence across platforms, contact details,
-    and platform account identifiers.
-    Credits: 0.1 per successful request.
-
-    Args:
-        email: The creator's email address.
-    """
-    result = await _api_post("/public/v1/creators/enrich/email/", {"email": email})
-    return json.dumps(result, indent=2)
-
-
-@mcp.tool(annotations=ToolAnnotations(title="Enrich by Email (Advanced)", readOnlyHint=True, destructiveHint=False))
-async def enrich_by_email_advanced(
+@mcp.tool(annotations=ToolAnnotations(title="Enrich by Email", readOnlyHint=True, destructiveHint=False))
+async def enrich_by_email(
     email: str,
+    tier: Literal["basic", "advanced"] = "basic",
     exclude_platforms: list[str] | None = None,
     min_followers: int | None = None,
 ) -> str:
-    """Look up a creator's social profiles using their email address (advanced tier).
+    """Look up a creator's social profiles using their email address.
 
-    Returns detailed cross-platform data: follower counts, engagement metrics,
-    content analytics, monetization indicators, and brand partnership history.
-    Credits: 2 per successful request.
+    tier="basic" (0.1 credits): Essential profile info, social presence, contact details.
+    tier="advanced" (2 credits): Full cross-platform data, engagement, brand partnerships.
 
     Args:
         email: The creator's email address.
-        exclude_platforms: Platforms to exclude from the response (e.g. ["tiktok", "youtube"]).
-        min_followers: Only return data for platforms where the creator has at least this many followers.
+        tier: "basic" for quick lookup (default), "advanced" for full cross-platform data.
+        exclude_platforms: Platforms to exclude (advanced only, e.g. ["tiktok", "youtube"]).
+        min_followers: Min followers threshold (advanced only).
     """
-    body: dict[str, Any] = {"email": email}
-    if exclude_platforms:
-        body["exclude_platforms"] = exclude_platforms
-    if min_followers is not None:
-        body["min_followers"] = min_followers
-    result = await _api_post("/public/v1/creators/enrich/email/advanced/", body)
+    email = _validate_email(email)
+    if not email:
+        return "Error: invalid email format. Please provide a valid email address."
+
+    if tier == "advanced":
+        body: dict[str, Any] = {"email": email}
+        if exclude_platforms:
+            body["exclude_platforms"] = exclude_platforms
+        if min_followers is not None:
+            body["min_followers"] = min_followers
+        result = await _api_post("/public/v1/creators/enrich/email/advanced/", body)
+    else:
+        result = await _api_post("/public/v1/creators/enrich/email/", {"email": email})
+
     return json.dumps(result, indent=2)
 
 
@@ -480,8 +491,13 @@ async def enrich_by_handle(
         include_lookalikes: Include lookalike creator recommendations (default True).
         include_audience_data: Include audience demographics - age, gender, location (Instagram, TikTok, YouTube only).
     """
+    handle = _validate_handle(handle)
+    if not handle:
+        return "Error: invalid handle. Please provide a valid creator username (without @)."
+    if platform not in ENRICH_PLATFORMS:
+        return f"Error: invalid platform '{platform}'. Must be one of: {', '.join(sorted(ENRICH_PLATFORMS))}."
     result = await _api_post("/public/v1/creators/enrich/handle/full/", {
-        "handle": handle.lstrip("@"),
+        "handle": handle,
         "platform": platform,
         "email_required": email_required,
         "include_lookalikes": include_lookalikes,
@@ -504,8 +520,13 @@ async def enrich_by_handle_raw(
         handle: The creator's handle/username (without @ symbol).
         platform: Platform (instagram, youtube, tiktok, onlyfans, twitter, snapchat, discord, pinterest, facebook, linkedin, twitch).
     """
+    handle = _validate_handle(handle)
+    if not handle:
+        return "Error: invalid handle. Please provide a valid creator username (without @)."
+    if platform not in ENRICH_PLATFORMS:
+        return f"Error: invalid platform '{platform}'. Must be one of: {', '.join(sorted(ENRICH_PLATFORMS))}."
     result = await _api_post("/public/v1/creators/enrich/handle/raw/", {
-        "handle": handle.lstrip("@"),
+        "handle": handle,
         "platform": platform,
     })
     return json.dumps(result, indent=2)
@@ -526,8 +547,13 @@ async def connected_socials(
         handle: The creator's handle/username (without @ symbol).
         platform: Seed platform (instagram, youtube, tiktok, onlyfans, twitter, snapchat, discord, pinterest, facebook, linkedin, twitch).
     """
+    handle = _validate_handle(handle)
+    if not handle:
+        return "Error: invalid handle. Please provide a valid creator username (without @)."
+    if platform not in ENRICH_PLATFORMS:
+        return f"Error: invalid platform '{platform}'. Must be one of: {', '.join(sorted(ENRICH_PLATFORMS))}."
     result = await _api_post("/public/v1/creators/socials/", {
-        "handle": handle.lstrip("@"),
+        "handle": handle,
         "platform": platform,
     })
     return json.dumps(result, indent=2)
@@ -563,6 +589,16 @@ async def create_batch_enrichment(
         exclude_platforms: Comma-separated platforms to exclude for email-based enrichment.
         min_followers: Minimum follower threshold.
     """
+    # Pre-flight checks
+    csv_err = _validate_csv(csv_content)
+    if csv_err:
+        return f"Error: {csv_err}."
+    if enrichment_mode not in ("raw", "full", "basic", "advanced"):
+        return "Error: enrichment_mode must be 'raw', 'full', 'basic', or 'advanced'."
+    if enrichment_mode in ("raw", "full") and not platform:
+        return "Error: platform is required for handle-based batch enrichment. Please specify instagram, youtube, tiktok, etc."
+
+    print(f"[MCP] POST /public/v1/enrichment/batch/ mode={enrichment_mode} platform={platform}", file=sys.stderr)
     async with httpx.AsyncClient(timeout=60) as client:
         files = {"file": ("creators.csv", csv_content.encode(), "text/csv")}
         data: dict[str, str] = {
@@ -593,34 +629,34 @@ async def create_batch_enrichment(
         return json.dumps(resp.json(), indent=2)
 
 
-@mcp.tool(annotations=ToolAnnotations(title="Get Batch Status", readOnlyHint=True, destructiveHint=False))
-async def get_batch_status(batch_id: str) -> str:
-    """Check the status of a batch enrichment job.
-
-    Returns status, total/processed/success/failed row counts, credits used, and estimated completion.
-    No credits consumed.
-
-    Args:
-        batch_id: The batch_id returned by create_batch_enrichment.
-    """
-    result = await _api_get(f"/public/v1/enrichment/batch/{batch_id}/status/")
-    return json.dumps(result, indent=2)
-
-
-@mcp.tool(annotations=ToolAnnotations(title="Get Batch Results", readOnlyHint=True, destructiveHint=False))
-async def get_batch_results(
+@mcp.tool(annotations=ToolAnnotations(title="Manage Batch", readOnlyHint=False, destructiveHint=False))
+async def manage_batch(
     batch_id: str,
+    action: Literal["status", "results", "resume"] = "status",
     format: Literal["csv", "json"] = "csv",
 ) -> str:
-    """Download results of a finished batch enrichment job.
-
-    Only call after get_batch_status returns 'finished'.
-    No credits consumed for download.
+    """Manage a batch enrichment job: check status, download results, or resume.
 
     Args:
         batch_id: The batch_id returned by create_batch_enrichment.
-        format: Output format - "csv" (default) or "json".
+        action: "status" to check progress, "results" to download (only when finished), "resume" to restart a paused batch.
+        format: Output format for results - "csv" (default) or "json". Only used with action="results".
     """
+    batch_id = _validate_path_param(batch_id)
+    if not batch_id:
+        return "Error: invalid batch_id. Must be alphanumeric with hyphens/underscores only."
+    if action not in ("status", "results", "resume"):
+        return "Error: action must be 'status', 'results', or 'resume'."
+
+    if action == "status":
+        result = await _api_get(f"/public/v1/enrichment/batch/{batch_id}/status/")
+        return json.dumps(result, indent=2)
+
+    if action == "resume":
+        result = await _api_post(f"/public/v1/enrichment/batch/{batch_id}/resume/", {})
+        return json.dumps(result, indent=2)
+
+    # action == "results"
     async with httpx.AsyncClient(timeout=60) as client:
         resp = await client.get(
             f"{BASE_URL}/public/v1/enrichment/batch/{batch_id}/",
@@ -636,20 +672,6 @@ async def get_batch_results(
         if format == "json":
             return json.dumps(resp.json(), indent=2)
         return resp.text
-
-
-@mcp.tool(annotations=ToolAnnotations(title="Resume Batch", readOnlyHint=False, destructiveHint=False))
-async def resume_batch(batch_id: str) -> str:
-    """Resume a paused batch enrichment job.
-
-    Batches pause when account runs out of credits. Add credits then resume.
-    No additional credits consumed for the resume call itself.
-
-    Args:
-        batch_id: The batch_id returned by create_batch_enrichment.
-    """
-    result = await _api_post(f"/public/v1/enrichment/batch/{batch_id}/resume/", {})
-    return json.dumps(result, indent=2)
 
 
 # ─── Content Data ──────────────────────────────────────────────────────────────
@@ -675,9 +697,15 @@ async def get_creator_posts(
         count: Number of posts per page (platform-specific limits apply).
         pagination_token: Cursor token from previous response for next page.
     """
+    handle = _validate_handle(handle)
+    if not handle:
+        return "Error: invalid handle. Please provide a valid creator username (without @)."
+    if platform not in CONTENT_PLATFORMS:
+        return f"Error: invalid platform '{platform}'. Content posts supports: {', '.join(sorted(CONTENT_PLATFORMS))}."
+
     body: dict[str, Any] = {
         "platform": platform,
-        "handle": handle.lstrip("@"),
+        "handle": handle,
     }
     if count is not None:
         body["count"] = count
@@ -706,10 +734,18 @@ async def get_post_details(
         content_type: Type of content: "data", "comments", "transcript", or "audio" (default "data").
         pagination_token: Pagination token for fetching subsequent pages of comments.
     """
+    # Pre-flight checks
+    if not post_id or not post_id.strip():
+        return "Error: post_id is required. Please provide the platform-specific post ID."
+    if platform not in CONTENT_PLATFORMS:
+        return f"Error: invalid platform '{platform}'. Post details supports: {', '.join(sorted(CONTENT_PLATFORMS))}."
+    if content_type not in ("data", "comments", "transcript", "audio"):
+        return "Error: content_type must be 'data', 'comments', 'transcript', or 'audio'."
+
     body: dict[str, Any] = {
         "platform": platform,
         "content_type": content_type,
-        "post_id": post_id,
+        "post_id": post_id.strip(),
     }
     if pagination_token:
         body["pagination_token"] = pagination_token
