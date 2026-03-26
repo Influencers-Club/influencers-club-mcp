@@ -1,6 +1,23 @@
 services:
   influencers-club-mcp:
     build: .
+    container_name: influencers-club-mcp
     stdin_open: true
+    ports:
+      - "127.0.0.1:${UPLOAD_PORT:-8090}:${UPLOAD_PORT:-8090}"
     environment:
       - INFLUENCERS_CLUB_API_KEY=${INFLUENCERS_CLUB_API_KEY}
+      - EXPORT_HOST_DIR=${EXPORT_HOST_DIR}
+      - IMPORT_HOST_DIR=${IMPORT_HOST_DIR}
+      - UPLOAD_PORT=${UPLOAD_PORT:-8090}
+      - UPLOAD_BIND=0.0.0.0
+    volumes:
+      - ${EXPORT_HOST_DIR:-./exports}:/exports
+      - ${IMPORT_HOST_DIR:-./imports}:/imports
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:noexec,nosuid,size=10m
+    mem_limit: 256m
+    cpus: "0.5"

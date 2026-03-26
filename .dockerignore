@@ -9,5 +9,3 @@ build/
 .env
 .git/
 .gitignore
-test_all_endpoints.py
-nul

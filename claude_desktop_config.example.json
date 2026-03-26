@@ -1,0 +1,29 @@
+{
+  "mcpServers": {
+    "influencers-club": {
+      "command": "docker",
+      "args": [
+        "run",
+        "-i",
+        "--rm",
+        "-p",
+        "127.0.0.1:8090:8090",
+        "-e",
+        "INFLUENCERS_CLUB_API_KEY=YOUR_API_KEY_HERE",
+        "-e",
+        "UPLOAD_PORT=8090",
+        "-e",
+        "UPLOAD_BIND=0.0.0.0",
+        "-v",
+        "EXPORTS_PATH_HERE:/exports",
+        "-v",
+        "IMPORTS_PATH_HERE:/imports",
+        "-e",
+        "EXPORT_HOST_DIR=EXPORTS_PATH_HERE",
+        "-e",
+        "IMPORT_HOST_DIR=IMPORTS_PATH_HERE",
+        "influencers-club-mcp"
+      ]
+    }
+  }
+}
