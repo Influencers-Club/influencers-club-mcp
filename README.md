@@ -6,7 +6,7 @@ MCP server for the [Influencers Club API](https://docs.influencers.club/) — cr
 
 ## Prerequisites
 
-- [Docker Desktop](https://www.docker.com/products/docker-desktop/) installed and running
+- Python 3.10+ or [Docker Desktop](https://www.docker.com/products/docker-desktop/)
 - An [Influencers Club API key](https://docs.influencers.club/#authentication)
 
 ## Installation
@@ -47,12 +47,21 @@ Add to your `claude_desktop_config.json`:
     "influencers-club": {
       "command": "influencers-club-mcp",
       "env": {
-        "INFLUENCERS_CLUB_API_KEY": "your_api_key_here"
+        "INFLUENCERS_CLUB_API_KEY": "your_api_key_here",
+        "UPLOAD_PORT": "8090",
+        "OUTPUT_DIR": "/path/to/influencers-club-mcp/exports",
+        "IMPORTS_DIR": "/path/to/influencers-club-mcp/imports",
+        "EXPORT_HOST_DIR": "/path/to/influencers-club-mcp/exports",
+        "IMPORT_HOST_DIR": "/path/to/influencers-club-mcp/imports"
       }
     }
   }
 }
 ```
+
+> **Note:** Replace `/path/to/influencers-club-mcp` with the actual path where you cloned the repo.
+> - **macOS/Linux:** `/Users/john/influencers-club-mcp`
+> - **Windows:** `C:\\Users\\John\\Desktop\\influencers-club-mcp` (use double backslashes)
 
 **Using Docker:**
 
@@ -94,12 +103,19 @@ Add to `.vscode/mcp.json` in your project:
     "influencers-club": {
       "command": "influencers-club-mcp",
       "env": {
-        "INFLUENCERS_CLUB_API_KEY": "your_api_key_here"
+        "INFLUENCERS_CLUB_API_KEY": "your_api_key_here",
+        "UPLOAD_PORT": "8090",
+        "OUTPUT_DIR": "/path/to/influencers-club-mcp/exports",
+        "IMPORTS_DIR": "/path/to/influencers-club-mcp/imports",
+        "EXPORT_HOST_DIR": "/path/to/influencers-club-mcp/exports",
+        "IMPORT_HOST_DIR": "/path/to/influencers-club-mcp/imports"
       }
     }
   }
 }
 ```
+
+> **Note:** Replace `/path/to/influencers-club-mcp` with the actual path where you cloned the repo.
 
 After configuring, restart your client. The server will appear as "influencers-club".
 

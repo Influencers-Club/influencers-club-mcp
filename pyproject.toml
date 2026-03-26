@@ -31,7 +31,7 @@ Repository = "https://github.com/Influencers-Club/influencers-club-mcp"
 Issues = "https://github.com/Influencers-Club/influencers-club-mcp/issues"
 
 [project.scripts]
-influencers-club-mcp = "influencers_club_mcp:mcp.run"
+influencers-club-mcp = "influencers_club_mcp:main"
 
 [build-system]
 requires = ["setuptools>=75.0"]
