@@ -19,13 +19,7 @@ cd influencers-club-mcp
 docker build -t influencers-club-mcp .
 ```
 
-### pip
-
-```bash
-pip install influencers-club-mcp
-```
-
-### From source
+### pip (from source)
 
 ```bash
 git clone https://github.com/Influencers-Club/influencers-club-mcp.git
