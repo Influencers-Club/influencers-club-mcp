@@ -99,6 +99,7 @@ mcp = FastMCP(
         "Only use 'hashtags' or 'keywords_in_bio' when the user explicitly specifies them.\n"
         "- discover_creators_to_file: Same as discover_creators but saves results to CSV on disk. "
         "Use when the user wants to save, export, or download a list.\n"
+        "- find_similar_creators: Find creators similar to a given creator. Present results in a table. Do NOT offer CSV/file export — it does not exist.\n"
         "- enrich_by_handle: Use for handle lookups. Parameters are 'handle' and 'platform'.\n"
         "- enrich_by_email: Basic email lookup (0.05 credits).\n"
         "- create_batch_enrichment: For bulk processing. CSV must have 'handle' or 'email' header, one value per line.\n\n"
@@ -201,7 +202,7 @@ def _preview_rows(data: list[dict], max_rows: int = 10) -> list[dict[str, str]]:
     present in the data, so previews work for any enrichment mode/platform.
     """
     # Always-show columns first, then platform-specific candidates in priority order
-    always_keys = ["input_value", "status"]
+    always_keys = ["handle", "status"]
     common_keys = ["first_name", "gender", "location", "is_creator", "has_brand_deals"]
     platform_keys_by_prefix = {
         "instagram": ["instagram.username", "instagram.follower_count", "instagram.engagement_percent"],
@@ -214,10 +215,20 @@ def _preview_rows(data: list[dict], max_rows: int = 10) -> list[dict[str, str]]:
     # Flatten a sample of rows to discover which keys exist
     sample_flats = []
     for item in data[:max_rows]:
-        flat = {"input_value": str(item.get("input_value", "")), "status": str(item.get("status", ""))}
-        result = item.get("result", {})
-        if result:
-            flat.update(_flatten(result))
+        flat: dict[str, str] = {}
+        for k, v in item.items():
+            if k == "result" and isinstance(v, dict):
+                flat.update(_flatten(v))
+            elif isinstance(v, dict):
+                flat.update(_flatten(v, k))
+            elif isinstance(v, (list, tuple)):
+                flat[k] = json.dumps(v) if v else ""
+            else:
+                flat[k] = "" if v is None else str(v)
+        if "handle" not in flat and "input_value" in flat:
+            flat["handle"] = flat.pop("input_value")
+        elif "handle" in flat and "input_value" in flat:
+            flat.pop("input_value")
         sample_flats.append(flat)
 
     # Detect which platform columns are present
@@ -256,10 +267,23 @@ def _json_batch_to_csv(data: Any) -> str:
     seen_keys: set[str] = set()
 
     for item in data:
-        flat = {"input_value": str(item.get("input_value", "")), "status": str(item.get("status", ""))}
-        result = item.get("result", {})
-        if result:
-            flat.update(_flatten(result))
+        flat: dict[str, str] = {}
+        # Flatten all top-level fields (input_value, status, handle, email, etc.)
+        for k, v in item.items():
+            if k == "result" and isinstance(v, dict):
+                # Promote result contents to top-level (no "result." prefix)
+                flat.update(_flatten(v))
+            elif isinstance(v, dict):
+                flat.update(_flatten(v, k))
+            elif isinstance(v, (list, tuple)):
+                flat[k] = json.dumps(v) if v else ""
+            else:
+                flat[k] = "" if v is None else str(v)
+        # Ensure handle column: use input_value as fallback
+        if "handle" not in flat and "input_value" in flat:
+            flat["handle"] = flat.pop("input_value")
+        elif "handle" in flat and "input_value" in flat:
+            flat.pop("input_value")  # avoid duplicate
         rows.append(flat)
         for k in flat:
             if k not in seen_keys:
@@ -433,7 +457,7 @@ async def find_similar_creators(
 ) -> str:
     """Find creators similar to a specified creator. Always sorted by relevancy (no custom sort).
     Costs 0.01 credits per creator returned.
-    IMPORTANT: Always present results in the exact order returned by the API — do NOT re-sort or reorder them."""
+    IMPORTANT: Present results in a table (handle, followers, engagement rate, etc.) in the exact order returned by the API — do NOT re-sort or reorder. Do NOT offer CSV export — no export tool exists for similar creators."""
     try:
         if not filter_value or not filter_value.strip():
             raise ValueError("filter_value is required")
