@@ -17,15 +17,15 @@ WORKDIR /app
 COPY --from=builder /app/deps /app/deps
 COPY --from=builder /app/influencers_club_mcp /app/influencers_club_mcp
 
-# Create exports and imports directories (overridden by bind mounts at runtime)
-RUN mkdir -p /exports /imports
+# Create exports and imports directories
+RUN mkdir -p /exports /imports && chown appuser:appgroup /exports /imports
+
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
 
 ENV PYTHONPATH=/app/deps
 
 EXPOSE 8090
 
-# Run as non-root user. If you get permission errors on /imports or /exports,
-# ensure the host directories are writable (chmod 777 or chown to UID 1000).
-USER appuser
-
-ENTRYPOINT ["python", "-m", "influencers_club_mcp"]
+# Start as root so entrypoint can fix volume permissions, then drop to appuser
+ENTRYPOINT ["/entrypoint.sh"]

@@ -12,8 +12,8 @@ services:
       - UPLOAD_PORT=${UPLOAD_PORT:-8090}
       - UPLOAD_BIND=0.0.0.0
     volumes:
-      - ${EXPORT_HOST_DIR:-./exports}:/exports
-      - ${IMPORT_HOST_DIR:-./imports}:/imports
+      - ${EXPORT_HOST_DIR:-./exports}:/exports:rw
+      - ${IMPORT_HOST_DIR:-./imports}:/imports:rw
     read_only: true
     security_opt:
       - no-new-privileges:true
