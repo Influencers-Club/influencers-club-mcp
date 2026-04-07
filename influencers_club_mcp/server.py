@@ -23,10 +23,17 @@ from .csv_export import creators_to_csv
 # ─── Constants ─────────────────────────────────────────────────────────
 API_V1 = "/public/v1"
 
-OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "/exports")
-IMPORTS_DIR = os.environ.get("IMPORTS_DIR", "/imports")
+def _is_docker() -> bool:
+    """Detect if running inside a Docker container."""
+    return os.path.exists("/.dockerenv") or os.path.exists("/run/.containerenv")
+
+_DEFAULT_EXPORTS = "/exports" if _is_docker() else os.path.join(os.getcwd(), "exports")
+_DEFAULT_IMPORTS = "/imports" if _is_docker() else os.path.join(os.getcwd(), "imports")
+
+OUTPUT_DIR = os.environ.get("OUTPUT_DIR", _DEFAULT_EXPORTS)
+IMPORTS_DIR = os.environ.get("IMPORTS_DIR", _DEFAULT_IMPORTS)
 MAX_EXPORT_PAGES = 10
-CONFIG_FILE = os.path.join(os.environ.get("OUTPUT_DIR", "/exports"), ".ic_config.json")
+CONFIG_FILE = os.path.join(OUTPUT_DIR, ".ic_config.json")
 UPLOAD_PORT = int(os.environ.get("UPLOAD_PORT", "8090"))
 
 

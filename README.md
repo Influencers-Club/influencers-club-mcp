@@ -34,18 +34,16 @@ Then add to your Claude Desktop `claude_desktop_config.json`:
 
 Restart Claude Desktop — the server will appear as "influencers-club". That's it.
 
-> **Optional:** To control where exported/uploaded CSV files are stored, add these env vars:
+> **Where do files go?** By default, exported CSVs and uploads are saved to `exports/` and `imports/` inside the cloned repo folder. No extra configuration needed.
+>
+> To use a custom location, add these env vars:
 >
 > ```json
-> "EXPORT_HOST_DIR": "/path/to/influencers-club-mcp/exports",
-> "IMPORT_HOST_DIR": "/path/to/influencers-club-mcp/imports",
-> "OUTPUT_DIR": "/path/to/influencers-club-mcp/exports",
-> "IMPORTS_DIR": "/path/to/influencers-club-mcp/imports"
+> "EXPORT_HOST_DIR": "/your/custom/exports",
+> "IMPORT_HOST_DIR": "/your/custom/imports",
+> "OUTPUT_DIR": "/your/custom/exports",
+> "IMPORTS_DIR": "/your/custom/imports"
 > ```
->
-> Replace `/path/to/influencers-club-mcp` with the actual path where you cloned the repo.
-> - **macOS/Linux:** `/Users/john/influencers-club-mcp`
-> - **Windows:** `C:\\Users\\John\\Desktop\\influencers-club-mcp` (use double backslashes)
 
 ## Other Clients
 
