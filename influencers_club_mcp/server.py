@@ -27,9 +27,18 @@ def _is_docker() -> bool:
     """Detect if running inside a Docker container."""
     return os.path.exists("/.dockerenv") or os.path.exists("/run/.containerenv")
 
-_REPO_DIR = str(Path(__file__).resolve().parent.parent)
-_DEFAULT_EXPORTS = "/exports" if _is_docker() else os.path.join(_REPO_DIR, "exports")
-_DEFAULT_IMPORTS = "/imports" if _is_docker() else os.path.join(_REPO_DIR, "imports")
+def _default_data_dir() -> str:
+    """Find the best directory for exports/imports outside Docker."""
+    # If installed editable (pip install -e .), use the repo folder
+    repo_dir = Path(__file__).resolve().parent.parent
+    if (repo_dir / "pyproject.toml").exists():
+        return str(repo_dir)
+    # Otherwise (pip install .), use ~/influencers-club-mcp
+    return str(Path.home() / "influencers-club-mcp")
+
+_DATA_DIR = _default_data_dir()
+_DEFAULT_EXPORTS = "/exports" if _is_docker() else os.path.join(_DATA_DIR, "exports")
+_DEFAULT_IMPORTS = "/imports" if _is_docker() else os.path.join(_DATA_DIR, "imports")
 
 OUTPUT_DIR = os.environ.get("OUTPUT_DIR", _DEFAULT_EXPORTS)
 IMPORTS_DIR = os.environ.get("IMPORTS_DIR", _DEFAULT_IMPORTS)
