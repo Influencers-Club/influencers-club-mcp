@@ -27,8 +27,9 @@ def _is_docker() -> bool:
     """Detect if running inside a Docker container."""
     return os.path.exists("/.dockerenv") or os.path.exists("/run/.containerenv")
 
-_DEFAULT_EXPORTS = "/exports" if _is_docker() else os.path.join(os.getcwd(), "exports")
-_DEFAULT_IMPORTS = "/imports" if _is_docker() else os.path.join(os.getcwd(), "imports")
+_REPO_DIR = str(Path(__file__).resolve().parent.parent)
+_DEFAULT_EXPORTS = "/exports" if _is_docker() else os.path.join(_REPO_DIR, "exports")
+_DEFAULT_IMPORTS = "/imports" if _is_docker() else os.path.join(_REPO_DIR, "imports")
 
 OUTPUT_DIR = os.environ.get("OUTPUT_DIR", _DEFAULT_EXPORTS)
 IMPORTS_DIR = os.environ.get("IMPORTS_DIR", _DEFAULT_IMPORTS)
