@@ -1,0 +1,6 @@
+# Force LF line endings for shell scripts (critical for Docker)
+*.sh text eol=lf
+
+# Dockerfile should also be LF
+Dockerfile text eol=lf
+docker-compose.yml text eol=lf
