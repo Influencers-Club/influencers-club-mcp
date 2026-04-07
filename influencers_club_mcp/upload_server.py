@@ -14,8 +14,15 @@ import time
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 
-OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "/exports")
-IMPORTS_DIR = os.environ.get("IMPORTS_DIR", "/imports")
+def _is_docker() -> bool:
+    """Detect if running inside a Docker container."""
+    return os.path.exists("/.dockerenv") or os.path.exists("/run/.containerenv")
+
+_DEFAULT_EXPORTS = "/exports" if _is_docker() else os.path.join(os.getcwd(), "exports")
+_DEFAULT_IMPORTS = "/imports" if _is_docker() else os.path.join(os.getcwd(), "imports")
+
+OUTPUT_DIR = os.environ.get("OUTPUT_DIR", _DEFAULT_EXPORTS)
+IMPORTS_DIR = os.environ.get("IMPORTS_DIR", _DEFAULT_IMPORTS)
 UPLOAD_PORT = int(os.environ.get("UPLOAD_PORT", "8090"))
 # Default to 127.0.0.1 (localhost only) for safety. Set to 0.0.0.0 inside Docker
 # where the host-side restriction is handled by Docker's -p 127.0.0.1:port:port mapping.
