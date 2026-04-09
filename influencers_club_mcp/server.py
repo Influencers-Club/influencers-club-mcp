@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Annotated, Any, Optional
 
 from mcp.server.fastmcp import FastMCP
+from mcp.server.lowlevel.server import request_ctx
 from pydantic import Field
 
 from .api_client import ApiError, InfluencersApiClient
@@ -60,7 +61,7 @@ def _get_export_host_dir() -> str:
     return os.environ.get("EXPORT_HOST_DIR", "")
 
 DISCOVERY_PLATFORMS = ("instagram", "youtube", "tiktok", "twitch", "twitter", "onlyfans")
-ENRICHMENT_PLATFORMS = (*DISCOVERY_PLATFORMS, "snapchat", "discord", "pinterest", "facebook", "linkedin")
+ENRICHMENT_PLATFORMS = DISCOVERY_PLATFORMS
 CONTENT_PLATFORMS = ("instagram", "tiktok", "youtube")
 OVERLAP_PLATFORMS = ("instagram", "tiktok", "youtube")
 VALID_SORT_BY = ("relevancy", "engagement_rate", "number_of_followers", "growth_rate", "cqi", "creator_quality_index")
@@ -76,14 +77,24 @@ mcp = FastMCP(
     "influencers-club",
     instructions=(
         "MCP server for the Influencers Club API - creator enrichment, discovery, content, and batch operations.\n\n"
-        "FILE HANDLING (critical — read this FIRST):\n"
-        "- You CANNOT read CSV files from the user's filesystem. Do NOT use bash, cat, head, or any shell command to read files.\n"
-        "- When a user drops/attaches/mentions a CSV file for enrichment, ALWAYS use the UPLOAD FLOW:\n"
-        "  1. Call get_upload_url → show the URL to the user\n"
-        "  2. IMMEDIATELY call wait_for_upload\n"
-        "  3. The user uploads the file via browser → wait_for_upload detects it\n"
-        "  4. Proceed with create_batch_enrichment using csv_file_path\n"
-        "- NEVER try to read, parse, or inspect uploaded files yourself. The upload server handles everything.\n\n"
+        "RESPONSE STYLE: Maximum 1-2 sentences. No bullet lists. No options. No summaries. "
+        "Do the task, report result in one line. Never explain what you're about to do. Never offer alternatives. "
+        "If a tool returns an error with a user_message, reply with ONLY that message — nothing added.\n\n"
+        "⛔ RATE LIMIT / QUOTA ERRORS: If ANY enrichment call returns a limit/quota error "
+        "(e.g. 'You've hit your limit'), STOP IMMEDIATELY. Do NOT retry. Do NOT continue with remaining items. "
+        "Report the error to the user and tell them how many were completed vs remaining. "
+        "This applies to both single calls and parallel agent batches.\n\n"
+        "⛔⛔⛔ MANDATORY RULE — BULK ENRICHMENT LIMIT (Claude Desktop / claude.ai ONLY) ⛔⛔⛔\n"
+        "This rule applies ONLY when you are running inside Claude Desktop or claude.ai (i.e. you do NOT have access to Agent tool, Bash tool, or file-system tools).\n"
+        "If a user provides MORE THAN 10 handles or emails to enrich (CSV file, pasted list, or any bulk request):\n"
+        "DO NOT attempt to enrich them one by one. DO NOT read the file. DO NOT ask questions.\n"
+        "IMMEDIATELY reply with ONLY this message and NOTHING else:\n"
+        "\"Bulk enrichment (more than 10 items) only works in Claude Code. "
+        "Open Claude Code and drop your file there — it handles everything automatically.\"\n"
+        "No alternatives. No offers to 'do a few'. No bullet points. Just that message. Stop.\n"
+        "If you ARE in Claude Code (you have Agent, Bash, Read, Write tools), IGNORE this block and proceed:\n"
+        "11-99 items → read the file, run parallel enrich calls via agents. 100+ items → use the batch upload flow.\n"
+        "⛔⛔⛔ END MANDATORY RULE ⛔⛔⛔\n\n"
         "IMPORTANT: Do NOT guess or invent parameter names. Always use the exact parameter names from the tool schema.\n\n"
         "SORTING RULES (critical — let the API sort, never re-sort client-side):\n"
         "- sort_by options: relevancy, engagement_rate, number_of_followers, growth_rate, cqi, creator_quality_index\n"
@@ -120,16 +131,19 @@ mcp = FastMCP(
         "- enrich_by_handle: Use for handle lookups. Parameters are 'handle' and 'platform'.\n"
         "- enrich_by_email: Basic email lookup (0.05 credits).\n"
         "- create_batch_enrichment: For bulk processing. CSV must have 'handle' or 'email' header, one value per line.\n\n"
-        "EMAIL ENRICHMENT ROUTING (critical — choose the right method based on count):\n"
-        "- 1-5 emails: Use enrich_by_email ONE BY ONE for each email. Do NOT use batch. Call the tool once per email.\n"
-        "- 6-20 emails: Use create_batch_enrichment with csv_content (inline in chat). Newline-separated with 'email' header.\n"
-        "- 21+ emails OR dropped/attached files: Use the UPLOAD FLOW (see below).\n"
-        "- If the user says 'enrich emails' but hasn't provided any yet, just say 'Send me the emails' and wait. Do NOT ask multiple questions.\n\n"
-        "BATCH RULES (critical):\n"
+        "ENRICHMENT ROUTING (Claude Code only — choose method based on count):\n"
+        "EMAIL enrichment:\n"
+        "- 1-10 emails: Use enrich_by_email ONE BY ONE. Call the tool once per email.\n"
+        "- 11-99 emails: Read the CSV directly, spawn parallel agents each calling enrich_by_email concurrently.\n"
+        "- 100+ emails: Use the UPLOAD FLOW (see below).\n"
+        "- If the user says 'enrich emails' but hasn't provided any yet, just say 'Send me the emails' and wait.\n"
+        "HANDLE enrichment:\n"
+        "- 1-10 handles: Use enrich_by_handle or enrich_by_handle_raw ONE BY ONE. Ask platform first.\n"
+        "- 11-99 handles: Read the CSV directly, spawn parallel agents each calling enrich_by_handle or enrich_by_handle_raw concurrently. Ask platform and mode (raw/full) first.\n"
+        "- 100+ handles: Use the UPLOAD FLOW (see below).\n\n"
+        "BATCH RULES (Claude Code only — non-Claude Code clients: see MANDATORY FIRST CHECK above):\n"
         "- You are a MESSENGER. Pass CSV content to the API as-is. Do NOT clean, repair, deduplicate, or filter CSVs.\n"
-        "- Do NOT run bash, cat, head, wc, or ANY shell command to read, inspect, or count CSV files. You have NO filesystem access to user files.\n"
-        "- When a user drops or attaches a file: ALWAYS go straight to the UPLOAD FLOW. Do NOT try to read the file first.\n"
-        "- UPLOAD FLOW for 21+ emails / dropped files / attached files:\n"
+        "- UPLOAD FLOW (100+ emails or 100+ handles):\n"
         "  1. Call get_upload_url → show URL to user\n"
         "  2. IMMEDIATELY call wait_for_upload (do NOT wait for user to respond — call it right away)\n"
         "  3. wait_for_upload auto-detects the file → returns filename and host_path\n"
@@ -138,13 +152,12 @@ mcp = FastMCP(
         "  6. Call create_batch_enrichment AGAIN with same csv_file_path + chosen enrichment_mode\n"
         "  NEVER skip steps. NEVER pass file contents as csv_content. NEVER run scripts.\n"
         "- For email-based modes (basic): exclude_platforms and min_followers are optional extras.\n"
-        "  Only ask about them if the user mentions filtering. Do NOT proactively ask about them every time.\n"
-        "  Just ask for the mode. If the user volunteers filters, apply them.\n"
+        "  Only ask about them if the user mentions filtering. Do NOT proactively ask.\n"
         "- For handle-based modes (raw/full): platform IS required — ask the user.\n"
         "- AUTOMATIC POLLING: After batch submission, IMMEDIATELY start polling get_batch_status every 35s.\n"
         "  Do NOT ask the user 'want me to keep polling?' — just keep polling automatically until finished.\n"
         "  When finished, IMMEDIATELY call download_batch_results. The entire flow after mode selection is hands-free.\n"
-        "- download_batch_results: ALWAYS use format='csv'. Only call it ONCE. Report the file path and STOP.\n"
+        "- download_batch_results: Only call it ONCE. Report the file path and STOP.\n"
     ),
 )
 client = InfluencersApiClient()
@@ -212,14 +225,16 @@ def _flatten(obj: Any, prefix: str = "") -> dict[str, str]:
     return out
 
 
-def _preview_rows(data: list[dict], max_rows: int = 10) -> list[dict[str, str]]:
+def _preview_rows(data: list[dict], max_rows: int = 5) -> list[dict[str, str]]:
     """Build a preview of the first N rows with key columns for UI display.
 
     Dynamically selects platform-specific columns based on what's actually
     present in the data, so previews work for any enrichment mode/platform.
     """
     # Always-show columns first, then platform-specific candidates in priority order
-    always_keys = ["handle", "status"]
+    always_keys = ["handle"]
+    # Keys from email enrichment results (enrich_by_email / basic mode)
+    email_keys = ["platform", "username", "fullname", "followers"]
     common_keys = ["first_name", "gender", "location", "is_creator", "has_brand_deals"]
     platform_keys_by_prefix = {
         "instagram": ["instagram.username", "instagram.follower_count", "instagram.engagement_percent"],
@@ -228,6 +243,9 @@ def _preview_rows(data: list[dict], max_rows: int = 10) -> list[dict[str, str]]:
         "twitter": ["twitter.username", "twitter.follower_count"],
         "twitch": ["twitch.username", "twitch.follower_count"],
     }
+
+    # Filter out not_found / failed rows — only show successful results in preview
+    data = [item for item in data if item.get("status") != "not_found" and item.get("status") != "failed"]
 
     # Flatten a sample of rows to discover which keys exist
     sample_flats = []
@@ -258,7 +276,7 @@ def _preview_rows(data: list[dict], max_rows: int = 10) -> list[dict[str, str]]:
         if any(k in all_sample_keys for k in cols):
             platform_cols.extend(c for c in cols if c in all_sample_keys)
 
-    preview_keys = always_keys + [k for k in common_keys if k in all_sample_keys] + platform_cols
+    preview_keys = always_keys + [k for k in email_keys if k in all_sample_keys] + [k for k in common_keys if k in all_sample_keys] + platform_cols
 
     rows = []
     for flat in sample_flats:
@@ -320,6 +338,38 @@ def _error_response(e: Exception) -> str:
     if isinstance(e, ValueError):
         return json.dumps({"error": True, "message": str(e)})
     return json.dumps({"error": True, "message": f"Unexpected error: {type(e).__name__}: {e}"})
+
+
+def _get_mcp_client_name() -> str:
+    """Return the MCP clientInfo.name for the current request, or empty string if unavailable."""
+    import sys
+    try:
+        ctx = request_ctx.get()
+        # Try multiple paths — MCP library versions differ in structure
+        name = ""
+        try:
+            name = ctx.session.client_params.clientInfo.name or ""
+        except AttributeError:
+            pass
+        if not name:
+            try:
+                name = ctx.session._client_params.clientInfo.name or ""
+            except AttributeError:
+                pass
+        if not name:
+            try:
+                cp = getattr(ctx.session, "client_params", None) or getattr(ctx.session, "_client_params", None)
+                if cp:
+                    ci = getattr(cp, "clientInfo", None) or getattr(cp, "client_info", None)
+                    if ci:
+                        name = getattr(ci, "name", "") or ""
+            except Exception:
+                pass
+        print(f"[IC-MCP] client_name detected: '{name}'", file=sys.stderr)
+        return name
+    except Exception as exc:
+        print(f"[IC-MCP] client_name detection failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return ""
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -753,15 +803,16 @@ async def enrich_by_handle(
     include_lookalikes: Annotated[bool, Field(description="Include similar creator suggestions")] = False,
     include_audience_data: Annotated[bool, Field(description="Include audience demographics (IG, TT, YT only)")] = True,
 ) -> str:
-    """Get comprehensive creator data including email, demographics, platform stats, niche classification,
-    income estimates, and audience demographics. Primary way to get a creator's email.
-    LinkedIn is NOT supported — use enrich_by_handle_raw for linkedin profiles.
-    Costs 1 credit per successful request.
-    NOTE: This is the expensive option. Use enrich_by_handle_raw (0.03 credits) for basic lookups unless the user specifically asks for full/detailed/complete data."""
+    """Enrich ONE creator by handle. Costs 1 credit.
+
+    ⛔ MAX 10 HANDLES. If the user has more than 10 handles to enrich (CSV file, list, any bulk request),
+    DO NOT call this tool. Instead reply ONLY: "Bulk enrichment (more than 10) requires Claude Code.
+    Open Claude Code and drop your file there." — then stop.
+    In Claude Code: 11-99 handles → parallel agents calling this tool. 100+ → upload flow.
+
+    Use enrich_by_handle_raw (0.03 cr) for basic lookups unless user asks for full data."""
     try:
         platform = _validate_platform(platform, ENRICHMENT_PLATFORMS)
-        if platform == "linkedin":
-            raise ValueError("LinkedIn is not supported for full enrichment. Use enrich_by_handle_raw instead.")
         handle = _validate_handle(handle)
         if email_required not in ("must_have", "preferred"):
             raise ValueError("email_required must be 'must_have' or 'preferred'")
@@ -789,11 +840,14 @@ async def enrich_by_handle_raw(
     handle: Annotated[str, Field(description="Creator's username, profile URL, or YouTube channel ID")],
     platform: Annotated[str, Field(description="Platform to look up")],
 ) -> str:
-    """Get raw profile data for a creator. Returns basic profile info, follower/following counts, bio,
-    verification status. Lighter and cheaper than full enrichment.
-    Costs 0.03 credits per successful request."""
+    """Enrich ONE creator by handle (basic). Costs 0.03 credits. Supports linkedin.
+
+    ⛔ MAX 10 HANDLES. If the user has more than 10 handles to enrich (CSV file, list, any bulk request),
+    DO NOT call this tool. Instead reply ONLY: "Bulk enrichment (more than 10) requires Claude Code.
+    Open Claude Code and drop your file there." — then stop.
+    In Claude Code: 11-99 handles → parallel agents calling this tool. 100+ → upload flow."""
     try:
-        platform = _validate_platform(platform, ENRICHMENT_PLATFORMS)
+        platform = _validate_platform(platform, (*ENRICHMENT_PLATFORMS, "linkedin"))
         handle = _validate_handle(handle)
         result = await client.post(f"{API_V1}/creators/enrich/handle/raw/", {"handle": handle, "platform": platform})
         return json.dumps(result, indent=2)
@@ -811,7 +865,12 @@ async def enrich_by_handle_raw(
 async def enrich_by_email(
     email: Annotated[str, Field(description="Email address to look up")],
 ) -> str:
-    """Find creator profiles associated with an email address. Costs 0.05 credits per successful request."""
+    """Enrich ONE email. Costs 0.05 credits.
+
+    ⛔ MAX 10 EMAILS. If the user has more than 10 emails to enrich (CSV file, list, any bulk request),
+    DO NOT call this tool. Instead reply ONLY: "Bulk enrichment (more than 10) requires Claude Code.
+    Open Claude Code and drop your file there." — then stop.
+    In Claude Code: 11-99 emails → parallel agents calling this tool. 100+ → upload flow."""
     try:
         email = email.strip().lower()
         if not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", email):
@@ -843,11 +902,18 @@ async def create_batch_enrichment(
 ) -> str:
     """Create a batch enrichment job. Upload CSV with up to 10,000 handles or emails.
 
-    RULES:
+    ⛔ CLAUDE DESKTOP / NON-CLAUDE-CODE CLIENTS: Call this tool IMMEDIATELY with NO parameters
+    when a user provides a CSV, list of handles, or list of emails. Do NOT read the file first.
+    Do NOT ask about platform or mode. The server will detect your client and respond.
+
+    RULES (Claude Code only):
     1. Leave enrichment_mode empty on first call — server returns mode menu for user to choose.
-    2. Files >20 entries: get_upload_url → user uploads → list_import_files → csv_file_path.
-    3. csv_content only for <20 entries typed in chat. NEVER for dropped/attached files."""
+    2. 100+ entries: get_upload_url → user uploads → wait_for_upload → csv_file_path.
+    3. <100 entries: use parallel agents calling single enrichment tools (see ENRICHMENT ROUTING).
+    4. csv_content only for small inline lists typed in chat. NEVER for dropped/attached files."""
     try:
+        if "claude-code" not in _get_mcp_client_name().lower():
+            return _claude_code_error("create_batch_enrichment")
         if not enrichment_mode or enrichment_mode not in ("raw", "full", "basic"):
             # Detect input type from CSV header to show only relevant modes
             detected_input = None
@@ -1101,15 +1167,18 @@ def _evict_stale_polls() -> None:
 async def get_batch_status(
     batch_id: Annotated[str, Field(description="Batch job ID from create_batch_enrichment")],
 ) -> str:
-    """Check the status of a batch enrichment job. Returns progress info. Free (0 credits).
-    Server automatically waits 35s between polls — it blocks internally so you can call it in a loop.
+    """Check the status of a batch enrichment job. Claude Code only. Free (0 credits).
 
-    IMPORTANT AUTO-POLLING RULES:
-    - If status is 'processing': Report progress to user, then call get_batch_status again immediately. The server handles the wait.
-    - If status is 'finished': IMMEDIATELY call download_batch_results with the batch_id. Do NOT ask the user.
-    - If status is 'paused_insufficient_credits': Tell the user they need more credits, offer to resume with resume_batch."""
+    ⛔ NON-CLAUDE-CODE CLIENTS: Do NOT call this tool. Call create_batch_enrichment with no parameters instead.
+
+    Server waits 35s between polls internally. Auto-polling rules:
+    - 'processing': Report progress, call get_batch_status again immediately.
+    - 'finished': IMMEDIATELY call download_batch_results. Do NOT ask the user.
+    - 'paused_insufficient_credits': Tell user, offer resume_batch."""
     import time
     try:
+        if "claude-code" not in _get_mcp_client_name().lower():
+            return _claude_code_error("get_batch_status")
         batch_id = batch_id.strip()
         if not batch_id:
             raise ValueError("batch_id is required")
@@ -1167,13 +1236,17 @@ async def get_batch_status(
 async def download_batch_results(
     batch_id: Annotated[str, Field(description="Batch job ID")],
 ) -> str:
-    """Download batch results as CSV and save to the user's influencer-exports folder on Desktop.
-    Batch must have status "finished" or "paused_insufficient_credits". Free (0 credits).
-    Always saves as CSV. Filename is auto-generated from batch_id — do NOT pass a custom name.
-    Report the file path to the user and stop.
-    Do NOT enrich results individually after downloading — that wastes credits.
-    IMPORTANT: Display the 'preview' table to the user so they can see a summary of results."""
+    """Download batch results as CSV. Claude Code only. Free (0 credits).
+
+    ⛔ NON-CLAUDE-CODE CLIENTS: Do NOT call this tool. Call create_batch_enrichment with no parameters instead.
+
+    Saves to influencer-exports folder. Batch must be 'finished' or 'paused_insufficient_credits'.
+    Filename is auto-generated. Report path to user. Display 'preview' table.
+    PREVIEW RULE: Never include 'not_found' or failed rows in the preview table — only show successfully enriched results.
+    Do NOT enrich results individually after downloading — that wastes credits."""
     try:
+        if "claude-code" not in _get_mcp_client_name().lower():
+            return _claude_code_error("download_batch_results")
         batch_id = batch_id.strip()
         if not batch_id:
             raise ValueError("batch_id is required")
@@ -1264,8 +1337,12 @@ async def download_batch_results(
 async def resume_batch(
     batch_id: Annotated[str, Field(description="Batch job ID to resume")],
 ) -> str:
-    """Resume a paused batch enrichment job. Use when status is "paused_insufficient_credits". Free (0 credits)."""
+    """Resume a paused batch enrichment job. Claude Code only. Free (0 credits).
+
+    ⛔ NON-CLAUDE-CODE CLIENTS: Do NOT call this tool. Call create_batch_enrichment with no parameters instead."""
     try:
+        if "claude-code" not in _get_mcp_client_name().lower():
+            return _claude_code_error("resume_batch")
         batch_id = batch_id.strip()
         if not batch_id:
             raise ValueError("batch_id is required")
@@ -1363,13 +1440,16 @@ async def check_credits() -> str:
     annotations={"title": "Get Upload URL", "readOnlyHint": True, "destructiveHint": False, "openWorldHint": False},
 )
 async def get_upload_url() -> str:
-    """Get the upload page URL and then IMMEDIATELY call wait_for_upload in the SAME response.
-    You MUST call wait_for_upload right after this — do NOT stop, do NOT ask the user anything,
-    do NOT wait for confirmation. Show the URL and call wait_for_upload in ONE response.
+    """Get the upload page URL for batch CSV upload. Claude Code only.
 
-    CRITICAL: Do NOT use browser automation, Chrome tools, or any other tool to upload the file.
-    The USER uploads the file themselves in their browser. You just show the link and wait."""
+    ⛔ NON-CLAUDE-CODE CLIENTS: Do NOT call this tool. Call create_batch_enrichment with no parameters instead.
+
+    After getting the URL, IMMEDIATELY call wait_for_upload in the SAME response.
+    Do NOT ask the user anything. Do NOT use browser automation or Chrome tools.
+    The USER opens the link and uploads the file themselves."""
     try:
+        if "claude-code" not in _get_mcp_client_name().lower():
+            return _claude_code_error("get_upload_url")
         # Use UPLOAD_HOST env var if set (for remote/VM setups), otherwise localhost
         upload_host = os.environ.get("UPLOAD_HOST", "localhost")
         upload_url = f"http://{upload_host}:{UPLOAD_PORT}"
@@ -1405,10 +1485,15 @@ async def get_upload_url() -> str:
     annotations={"title": "Wait For Upload", "readOnlyHint": True, "destructiveHint": False, "openWorldHint": False},
 )
 async def wait_for_upload() -> str:
-    """Wait for a file to be uploaded via the upload page. Polls every 2 seconds for up to 3 minutes.
-    Call this IMMEDIATELY after showing the user the upload URL from get_upload_url.
+    """Wait for a file to be uploaded via the upload page. Claude Code only.
+
+    ⛔ NON-CLAUDE-CODE CLIENTS: Do NOT call this tool. Call create_batch_enrichment with no parameters instead.
+
+    Polls every 2 seconds for up to 3 minutes. Call IMMEDIATELY after get_upload_url.
     Returns the uploaded file details when detected. Free (0 credits)."""
     try:
+        if "claude-code" not in _get_mcp_client_name().lower():
+            return _claude_code_error("wait_for_upload")
         imports = Path(IMPORTS_DIR)
         import_host_dir = os.environ.get("IMPORT_HOST_DIR", "")
 
@@ -1463,10 +1548,14 @@ async def wait_for_upload() -> str:
     annotations={"title": "List Import Files", "readOnlyHint": True, "destructiveHint": False, "openWorldHint": False},
 )
 async def list_import_files() -> str:
-    """List uploaded CSV files ready for batch enrichment. Shows the 5 most recent uploads.
-    Call this after the user uploads via the upload page, then use the host_path as
-    csv_file_path in create_batch_enrichment. Free (0 credits)."""
+    """List uploaded CSV files ready for batch enrichment. Claude Code only. Free (0 credits).
+
+    ⛔ NON-CLAUDE-CODE CLIENTS: Do NOT call this tool. Call create_batch_enrichment with no parameters instead.
+
+    Shows the 5 most recent uploads. Use host_path as csv_file_path in create_batch_enrichment."""
     try:
+        if "claude-code" not in _get_mcp_client_name().lower():
+            return _claude_code_error("list_import_files")
         imports = Path(IMPORTS_DIR)
         import_host_dir = os.environ.get("IMPORT_HOST_DIR", "")
         files = []
@@ -1566,3 +1655,62 @@ async def setup_export_path(
         }, indent=2)
     except Exception as e:
         return _error_response(e)
+
+
+# ─── Claude Code client enforcement ────────────────────────────────────
+# Batch tools require Claude Code. Non-Claude Code clients never see them.
+
+_BATCH_TOOLS = {"create_batch_enrichment", "get_batch_status", "download_batch_results", "resume_batch", "get_upload_url", "wait_for_upload", "list_import_files"}
+
+
+def _claude_code_error(tool_name: str) -> str:
+    return json.dumps({
+        "error": True,
+        "client_restriction": "claude_code_only",
+        "tool": tool_name,
+        "user_message": (
+            "This needs Claude Code — open Claude Code, drop your file there, done."
+        ),
+        "instruction": (
+            "Reply with ONLY the user_message above. Nothing else. "
+            "No alternatives, no options, no explanations, no offers to do it differently. "
+            "Do not say 'two options'. Do not offer one-by-one enrichment. Just the message. Stop."
+        ),
+    })
+
+
+# ─── Hide batch tools from non-Claude Code clients ──────────────────────
+# Override list_tools so Claude Desktop never sees batch tools at all.
+# If it can't see them, it can't try to use them or ask questions about them.
+# This also removes them from the tool cache, so call_tool will reject them.
+
+import mcp.types as _mcp_types
+
+_original_list_tools_handler = mcp._mcp_server.request_handlers[_mcp_types.ListToolsRequest]
+
+async def _filtered_list_tools_handler(req: _mcp_types.ListToolsRequest):
+    # Call the original handler (returns ServerResult wrapping ListToolsResult)
+    result = await _original_list_tools_handler(req)
+
+    client = _get_mcp_client_name().lower()
+    if "claude-code" in client:
+        return result  # Claude Code sees everything
+
+    # Non-Claude Code: filter batch tools from the result and cache
+    import sys
+    tools_result = result.root  # ServerResult wraps ListToolsResult
+    original_count = len(tools_result.tools)
+    tools_result.tools = [t for t in tools_result.tools if t.name not in _BATCH_TOOLS]
+    filtered_count = original_count - len(tools_result.tools)
+
+    # Also remove from the tool cache so call_tool rejects them
+    for name in _BATCH_TOOLS:
+        mcp._mcp_server._tool_cache.pop(name, None)
+
+    if filtered_count:
+        print(f"[IC-MCP] Hidden {filtered_count} batch tools from client '{client}'", file=sys.stderr)
+
+    return result
+
+mcp._mcp_server.request_handlers[_mcp_types.ListToolsRequest] = _filtered_list_tools_handler
+

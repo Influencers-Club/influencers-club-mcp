@@ -49,7 +49,7 @@ Restart Claude Desktop — the server will appear as "influencers-club". That's 
 
 ### Claude Code
 
-Add to your project's `.mcp.json`:
+Add to your project's `.mcp.json` or global `~/.claude/settings.json`:
 
 ```json
 {
@@ -223,7 +223,7 @@ After configuring, restart your client. The server will appear as "influencers-c
 | `raw` | handles | 0.03/record | Yes |
 | `full` | handles | 1/record | Yes |
 
-For large files (20+ entries), Claude opens a browser upload page at `http://localhost:8090`. Drag-and-drop your CSV — Claude auto-detects the upload and starts processing.
+For large files (100+ entries), Claude opens a browser upload page at `http://localhost:8090`. Drag-and-drop your CSV — Claude auto-detects the upload and starts processing. For smaller batches (under 100), Claude enriches them in parallel automatically.
 
 The upload page accepts multi-column CSVs and automatically extracts the correct column.
 
@@ -231,7 +231,7 @@ The upload page accepts multi-column CSVs and automatically extracts the correct
 
 | Capability | Platforms |
 |---|---|
-| Enrichment | Instagram, TikTok, YouTube, OnlyFans, X/Twitter, Twitch, Facebook, Pinterest, Discord, Snapchat, LinkedIn |
+| Enrichment | Instagram, TikTok, YouTube, OnlyFans, X/Twitter, Twitch, LinkedIn (raw mode only) |
 | Discovery | Instagram, TikTok, YouTube, OnlyFans, X/Twitter, Twitch |
 | Content Data | Instagram, TikTok, YouTube |
 | Audience Overlap | Instagram, TikTok, YouTube |
