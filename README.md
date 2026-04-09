@@ -2,7 +2,7 @@
 
 > **Beta** — This project is under active development. It works and can be tested, but expect changes before the stable release.
 
-MCP server for the [Influencers Club API](https://docs.influencers.club/) — creator enrichment, discovery, audience analysis, content data, batch operations, and account management.
+MCP server for the [Influencers Club API](https://influencers.club/influencer-api/) — creator enrichment, discovery, audience analysis, content data, batch operations, and account management.
 
 ## Prerequisites
 
