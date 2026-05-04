@@ -13,6 +13,14 @@ from typing import Any
 
 import httpx
 
+try:
+    # Available when running under FastMCP HTTP transport with auth wired up.
+    # In stdio mode this import succeeds but get_access_token() returns None.
+    from mcp.server.auth.middleware.auth_context import get_access_token
+except Exception:  # pragma: no cover — defensive against package layout drift
+    def get_access_token():  # type: ignore[misc]
+        return None
+
 BASE_URL = "https://api-dashboard.influencers.club"
 DEFAULT_TIMEOUT = 30.0
 BATCH_TIMEOUT = 60.0
@@ -68,43 +76,62 @@ class _SlidingWindowRateLimiter:
 
 
 class InfluencersApiClient:
-    """Async HTTP client for the Influencers.club API."""
+    """Async HTTP client for the Influencers.club API.
+
+    Token resolution is per-request to support both modes:
+      - stdio (single-tenant): token comes from INFLUENCERS_CLUB_API_KEY env var
+      - HTTP (multi-tenant, post-OAuth): token comes from the authenticated
+        request via FastMCP's auth context (get_access_token).
+    """
 
     def __init__(self) -> None:
-        api_key = os.environ.get("INFLUENCERS_CLUB_API_KEY", "")
-        if not api_key or not api_key.strip():
-            raise ValueError("INFLUENCERS_CLUB_API_KEY environment variable is required")
-
-        # Strip "Bearer " prefix if present — we add it ourselves
-        self._api_key = api_key.strip()
-        if self._api_key.startswith("Bearer "):
-            self._api_key = self._api_key[7:].strip()
+        env_key = os.environ.get("INFLUENCERS_CLUB_API_KEY", "").strip()
+        if env_key.startswith("Bearer "):
+            env_key = env_key[7:].strip()
+        self._env_api_key = env_key  # may be empty in HTTP mode
 
         max_rate = int(os.environ.get("MAX_CALLS_PER_MINUTE", str(RATE_LIMIT)))
         self._rate_limiter = _SlidingWindowRateLimiter(max_rate, RATE_WINDOW)
         self._client: httpx.AsyncClient | None = None
+
+    def _resolve_token(self) -> str:
+        """Resolve the bearer token for the current request.
+
+        Order: per-request OAuth access token → env var fallback.
+        Raises if neither is available.
+        """
+        access_token = get_access_token()
+        if access_token and access_token.token:
+            tok = access_token.token
+            return tok[7:].strip() if tok.startswith("Bearer ") else tok
+        if self._env_api_key:
+            return self._env_api_key
+        raise ApiError(
+            401,
+            "No bearer token available — provide INFLUENCERS_CLUB_API_KEY (stdio) "
+            "or authenticate via OAuth (HTTP).",
+        )
 
     async def _get_client(self) -> httpx.AsyncClient:
         """Return a shared AsyncClient, creating it lazily on first use."""
         if self._client is None or self._client.is_closed:
             self._client = httpx.AsyncClient(
                 base_url=BASE_URL,
-                headers={
-                    "Authorization": f"Bearer {self._api_key}",
-                    "Accept": "application/json",
-                },
+                headers={"Accept": "application/json"},
                 timeout=DEFAULT_TIMEOUT,
             )
         return self._client
 
     def _headers(self) -> dict[str, str]:
         return {
-            "Authorization": f"Bearer {self._api_key}",
+            "Authorization": f"Bearer {self._resolve_token()}",
             "Accept": "application/json",
         }
 
     def _handle_error(self, e: Exception) -> ApiError:
         """Normalize exceptions into ApiError with credential redaction."""
+        if isinstance(e, ApiError):
+            return e
         if isinstance(e, httpx.HTTPStatusError):
             status = e.response.status_code
             try:
@@ -132,6 +159,7 @@ class InfluencersApiClient:
             resp = await client.get(
                 path,
                 params=params,
+                headers=self._headers(),
                 timeout=timeout,
             )
             _log(f"GET {path} -> {resp.status_code}")
@@ -152,7 +180,7 @@ class InfluencersApiClient:
             resp = await client.post(
                 path,
                 json=body,
-                headers={"Content-Type": "application/json"},
+                headers={**self._headers(), "Content-Type": "application/json"},
                 timeout=timeout,
             )
             _log(f"POST {path} -> {resp.status_code}")
@@ -173,6 +201,7 @@ class InfluencersApiClient:
                 path,
                 files=files,
                 data=data,
+                headers=self._headers(),
                 timeout=timeout,
             )
             _log(f"POST {path} -> {resp.status_code}")
