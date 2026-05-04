@@ -192,6 +192,22 @@ mcp = FastMCP(
 client = InfluencersApiClient()
 
 
+def stdio_only_tool(*tool_args, **tool_kwargs):
+    """Register a tool only in stdio mode.
+
+    Used for tools that depend on a local filesystem or the localhost upload
+    server — they have no equivalent on shared infra. In HTTP mode the function
+    is left undecorated and never exposed to the client. The hosted version
+    will replace these with presigned-URL flows once the dashboard team ships
+    the S3 endpoints.
+    """
+    if HTTP_MODE:
+        def _passthrough(fn):
+            return fn
+        return _passthrough
+    return mcp.tool(*tool_args, **tool_kwargs)
+
+
 # ─── Helpers ───────────────────────────────────────────────────────────
 def _validate_platform(platform: str, allowed: tuple) -> str:
     p = platform.strip().lower()
@@ -443,7 +459,7 @@ async def discover_creators(
 # ═══════════════════════════════════════════════════════════════════════
 # 1b. DISCOVER CREATORS TO FILE
 # ═══════════════════════════════════════════════════════════════════════
-@mcp.tool(
+@stdio_only_tool(
     name="discover_creators_to_file",
     annotations={"title": "Discover Creators to File", "readOnlyHint": False, "destructiveHint": False, "openWorldHint": True},
 )
@@ -1464,7 +1480,7 @@ async def check_credits() -> str:
 # ═══════════════════════════════════════════════════════════════════════
 # 25. GET UPLOAD URL
 # ═══════════════════════════════════════════════════════════════════════
-@mcp.tool(
+@stdio_only_tool(
     name="get_upload_url",
     annotations={"title": "Get Upload URL", "readOnlyHint": True, "destructiveHint": False, "openWorldHint": False},
 )
@@ -1509,7 +1525,7 @@ async def get_upload_url() -> str:
 # ═══════════════════════════════════════════════════════════════════════
 # 25b. WAIT FOR UPLOAD
 # ═══════════════════════════════════════════════════════════════════════
-@mcp.tool(
+@stdio_only_tool(
     name="wait_for_upload",
     annotations={"title": "Wait For Upload", "readOnlyHint": True, "destructiveHint": False, "openWorldHint": False},
 )
@@ -1572,7 +1588,7 @@ async def wait_for_upload() -> str:
 # ═══════════════════════════════════════════════════════════════════════
 # 26. LIST IMPORT FILES
 # ═══════════════════════════════════════════════════════════════════════
-@mcp.tool(
+@stdio_only_tool(
     name="list_import_files",
     annotations={"title": "List Import Files", "readOnlyHint": True, "destructiveHint": False, "openWorldHint": False},
 )
@@ -1613,7 +1629,7 @@ async def list_import_files() -> str:
 # ═══════════════════════════════════════════════════════════════════════
 # 26b. LIST EXPORT FILES (results/output)
 # ═══════════════════════════════════════════════════════════════════════
-@mcp.tool(
+@stdio_only_tool(
     name="list_export_files",
     annotations={"title": "List Export Files", "readOnlyHint": True, "destructiveHint": False, "openWorldHint": False},
 )
@@ -1647,7 +1663,7 @@ async def list_export_files() -> str:
 # ═══════════════════════════════════════════════════════════════════════
 # 27. SETUP EXPORT PATH
 # ═══════════════════════════════════════════════════════════════════════
-@mcp.tool(
+@stdio_only_tool(
     name="setup_export_path",
     annotations={"title": "Setup Export Path", "readOnlyHint": False, "destructiveHint": False, "openWorldHint": False},
 )
