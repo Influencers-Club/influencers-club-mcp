@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Annotated, Any, Optional
 
 from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp.server import TransportSecuritySettings
 from mcp.server.lowlevel.server import request_ctx
 from pydantic import Field
 
@@ -73,6 +74,33 @@ CREDIT_COSTS = {
 }
 
 # ─── Initialize ────────────────────────────────────────────────────────
+# Hosted (HTTP) mode is on whenever MCP_TRANSPORT selects an HTTP transport.
+# Used to (a) configure DNS-rebinding/Origin protection, (b) gate localhost-only
+# tools that don't make sense on shared infra.
+HTTP_MODE = os.environ.get("MCP_TRANSPORT", "stdio").lower() in ("http", "streamable-http")
+
+# Comma-separated lists, e.g. ALLOWED_ORIGINS="https://claude.ai,https://claude.com"
+def _split_csv(name: str) -> list[str]:
+    raw = os.environ.get(name, "")
+    return [p.strip() for p in raw.split(",") if p.strip()]
+
+_transport_security = (
+    TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=_split_csv("ALLOWED_HOSTS"),
+        allowed_origins=_split_csv("ALLOWED_ORIGINS"),
+    )
+    if HTTP_MODE
+    else None
+)
+
+_mcp_kwargs: dict[str, Any] = {}
+if HTTP_MODE:
+    _mcp_kwargs["transport_security"] = _transport_security
+    _mcp_kwargs["host"] = os.environ.get("MCP_HOST", "0.0.0.0")
+    _mcp_kwargs["port"] = int(os.environ.get("MCP_PORT", "8000"))
+    _mcp_kwargs["streamable_http_path"] = os.environ.get("MCP_PATH", "/mcp")
+
 mcp = FastMCP(
     "influencers-club",
     instructions=(
@@ -159,6 +187,7 @@ mcp = FastMCP(
         "  When finished, IMMEDIATELY call download_batch_results. The entire flow after mode selection is hands-free.\n"
         "- download_batch_results: Only call it ONCE. Report the file path and STOP.\n"
     ),
+    **_mcp_kwargs,
 )
 client = InfluencersApiClient()
 
