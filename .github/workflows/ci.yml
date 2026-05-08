@@ -1,0 +1,69 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+# Cancel in-progress runs for the same branch when a new commit lands.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  smoke:
+    name: Smoke (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.10', '3.11', '3.12', '3.13']
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install package
+        run: pip install -e .
+
+      - name: Syntax check (compileall)
+        run: python -m compileall -q influencers_club_mcp
+
+      - name: Smoke test — stdio mode
+        env:
+          INFLUENCERS_CLUB_API_KEY: dummy_for_ci
+        run: |
+          python - <<'PY'
+          from influencers_club_mcp.server import mcp
+          tools = mcp._tool_manager.list_tools()
+          print(f"stdio: {len(tools)} tools registered")
+          assert len(tools) > 0, "no tools registered in stdio mode"
+          PY
+
+      - name: Smoke test — streamable-http mode
+        env:
+          INFLUENCERS_CLUB_API_KEY: dummy_for_ci
+          MCP_TRANSPORT: http
+          ALLOWED_ORIGINS: https://claude.ai,https://claude.com
+          ALLOWED_HOSTS: mcp.influencers.club
+        run: |
+          python - <<'PY'
+          import importlib
+          mod = importlib.import_module("influencers_club_mcp.server")
+          tools = mod.mcp._tool_manager.list_tools()
+          http_mode = getattr(mod, "HTTP_MODE", None)
+          print(f"http:  {len(tools)} tools registered, HTTP_MODE={http_mode}")
+          assert len(tools) > 0, "no tools registered in HTTP mode"
+          # If the branch has the HTTP_MODE flag (post #1), verify it activated.
+          if http_mode is not None:
+              assert http_mode is True, \
+                  f"MCP_TRANSPORT=http set but HTTP_MODE={http_mode}"
+              assert mod.mcp.settings.host == "0.0.0.0", \
+                  f"unexpected host {mod.mcp.settings.host}"
+              assert mod.mcp.settings.streamable_http_path == "/mcp", \
+                  f"unexpected path {mod.mcp.settings.streamable_http_path}"
+          PY
