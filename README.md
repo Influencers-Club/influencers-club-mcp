@@ -262,7 +262,7 @@ This MCP server is a thin client between Claude and the [Influencers Club API](h
 
 **Retention.** The server retains nothing in-process beyond the lifetime of a single tool call, with the exception of the user-controlled CSV files described above, which the user can delete at any time. Bearer tokens are read from environment variables (or, in hosted/HTTP mode, from the authenticated request) and are never written to disk.
 
-**Contact.** Privacy questions and data-deletion requests: **shaklev@influencers.club**. Security disclosures may also be filed via [GitHub Issues](https://github.com/Influencers-Club/influencers-club-mcp/issues).
+**Contact.** Privacy questions and data-deletion requests: **gjorgji.p@influencers.club**. Security disclosures may also be filed via [GitHub Issues](https://github.com/Influencers-Club/influencers-club-mcp/issues).
 
 ## Support
 
