@@ -250,7 +250,19 @@ The upload page accepts multi-column CSVs and automatically extracts the correct
 
 ## Privacy Policy
 
-This MCP server acts as a pass-through to the [Influencers Club API](https://docs.influencers.club/). It does not collect, store, or log any user data, conversation data, or API responses. All data flows directly between Claude and the Influencers Club API using your personal API key. For the Influencers Club data and privacy practices, refer to the [Influencers Club Privacy Policy](https://influencers.club/privacy-policy).
+This MCP server is a thin client between Claude and the [Influencers Club API](https://docs.influencers.club/). The sections below describe what the server itself does with your data; the Influencers Club platform's full data practices are governed by the [Influencers Club Privacy Policy](https://influencers.club/privacy-policy).
+
+**Data we collect.** None. The server does not collect, persist, or transmit personally identifiable information about the human using Claude. The only inputs it receives are the tool arguments Claude sends (e.g. a creator handle or a CSV path) and the bearer token used to authenticate against the Influencers Club API.
+
+**How data is used.** Tool arguments are forwarded directly to the Influencers Club API to fulfill the requested operation (discovery, enrichment, batch processing, etc.). Responses are returned to Claude. The server performs no analytics, profiling, or model training on this data.
+
+**Storage.** The server keeps no database. The only data written to disk are: (a) CSV exports/imports the user explicitly creates via the file tools, written to local directories the user controls (`exports/`, `imports/`, or paths set by `EXPORT_HOST_DIR` / `IMPORT_HOST_DIR`); (b) a small `.ic_config.json` file storing the chosen export path. No conversation content, API responses, or credentials are persisted.
+
+**Third-party sharing.** The server communicates with exactly one third party: `api-dashboard.influencers.club`. No data is sent to any other endpoint, analytics service, or telemetry provider. The bearer token is transmitted only to the Influencers Club API over HTTPS and is redacted from any error messages returned to Claude.
+
+**Retention.** The server retains nothing in-process beyond the lifetime of a single tool call, with the exception of the user-controlled CSV files described above, which the user can delete at any time. Bearer tokens are read from environment variables (or, in hosted/HTTP mode, from the authenticated request) and are never written to disk.
+
+**Contact.** Privacy questions and data-deletion requests: **gjorgji.p@influencers.club**. Security disclosures may also be filed via [GitHub Issues](https://github.com/Influencers-Club/influencers-club-mcp/issues).
 
 ## Support
 
