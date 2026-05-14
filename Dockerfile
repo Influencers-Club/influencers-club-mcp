@@ -1,4 +1,4 @@
-FROM python:3.12-slim-bookworm AS builder
+FROM python:3.11-slim-bookworm AS builder
 
 WORKDIR /app
 
@@ -7,7 +7,7 @@ COPY influencers_club_mcp/ ./influencers_club_mcp/
 
 RUN pip install --no-cache-dir --target /app/deps .
 
-FROM python:3.12-slim-bookworm
+FROM python:3.11-slim-bookworm
 
 RUN groupadd --system appgroup && \
     useradd --system --gid appgroup --create-home --shell /bin/false appuser
