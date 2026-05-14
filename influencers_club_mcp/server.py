@@ -189,6 +189,16 @@ mcp = FastMCP(
     ),
     **_mcp_kwargs,
 )
+
+# Unauthenticated health probe for the ALB target group. See issue #13.
+if HTTP_MODE:
+    from starlette.requests import Request
+    from starlette.responses import JSONResponse
+
+    @mcp.custom_route("/healthcheck/", methods=["GET"])
+    async def healthcheck(_request: Request) -> JSONResponse:
+        return JSONResponse({"status": "ok"})
+
 client = InfluencersApiClient()
 
 
