@@ -1,0 +1,50 @@
+name: deploy-to-beanstalk
+
+on:
+  push:
+    branches: [stage]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    environment: Stage
+    strategy:
+      max-parallel: 4
+      matrix:
+        python-version: [3.11]
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v6
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install requirements
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+  deploy:
+    runs-on: ubuntu-latest
+    environment: Stage
+    needs: [build]
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v6
+
+      - name: Generate deployment package
+        run: zip -r deploy_package_${{ github.sha }}.zip . -x '*.git*'
+
+      - name: Deploy Elastic Beanstalk Application
+        uses: einaregilsson/beanstalk-deploy@v22
+        with:
+          aws_access_key:       ${{ secrets.ACCESS_KEY_ID }}
+          aws_secret_key:       ${{ secrets.SECRET_ACCESS_KEY }}
+          application_name:     ${{ secrets.ELASTIC_APP_NAME }}
+          environment_name:     ${{ secrets.ELASTIC_APP_NAME }}
+          version_label:        ver-${{ github.sha }}
+          existing_bucket_name: ${{ secrets.S3_BUNDLE_NAME }}
+          region:               ${{ secrets.AWS_REGION }}
+          deployment_package:   deploy_package_${{ github.sha }}.zip
