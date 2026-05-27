@@ -425,7 +425,7 @@ async def discover_creators(
     sort_by: Annotated[str, Field(description="Sort field: relevancy, engagement_rate, number_of_followers, growth_rate, cqi, or creator_quality_index. Can be combined with ai_search. growth_rate only on instagram/tiktok/youtube. number_of_followers not on onlyfans. relevancy only supports desc")] = "relevancy",
     sort_order: Annotated[str, Field(description="Sort direction: asc or desc (relevancy only supports desc)")] = "desc",
     ai_search: Annotated[Optional[str], Field(description="AI-powered semantic search (3-150 chars). Can be combined with any sort_by. Keep queries SHORT (e.g., 'fitness', 'Claude AI'). Do NOT add extra words.")] = None,
-    filters: Annotated[Optional[dict], Field(description="Optional filters object. Common: location (array), gender (string), number_of_followers ({min,max}), engagement_percent ({min,max}), keywords_in_bio (array of strings), is_verified (bool), keywords_in_captions (array), hashtags (array), brands (array), creator_has (object of booleans)")] = None,
+    filters: Annotated[Optional[dict], Field(description="Optional filters object. Common: type (string - creator type filter), location (array), gender (string), number_of_followers ({min,max}), engagement_percent ({min,max}), keywords_in_bio (array of strings), is_verified (bool), keywords_in_captions (array), hashtags (array), brands (array), creator_has (object of booleans)")] = None,
 ) -> str:
     """Search the Influencers.club database to discover creators/influencers. Returns profiles with basic stats.
     Costs 0.01 credits per creator returned.
