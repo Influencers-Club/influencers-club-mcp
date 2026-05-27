@@ -12,6 +12,12 @@ MCP server for the [Influencers Club API](https://docs.influencers.club/) — cr
 ## Quick Start (pip)
 
 ```bash
+pip install influencers-club-mcp
+```
+
+Or install from source:
+
+```bash
 git clone https://github.com/Influencers-Club/influencers-club-mcp.git
 cd influencers-club-mcp
 pip install -e .
