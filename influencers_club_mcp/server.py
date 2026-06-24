@@ -101,6 +101,17 @@ if HTTP_MODE:
     _mcp_kwargs["port"] = int(os.environ.get("MCP_PORT", "8000"))
     _mcp_kwargs["streamable_http_path"] = os.environ.get("MCP_PATH", "/mcp")
 
+    # OAuth 2.1 resource-server mode (opt-in via MCP_OAUTH_ENABLED). Validates
+    # dashboard-issued access tokens; the SDK then auto-serves the protected-
+    # resource metadata + 401 WWW-Authenticate discovery that Claude needs.
+    # When disabled, behaviour is unchanged (single shared env token).
+    from .auth import build_auth
+
+    _token_verifier, _auth_settings = build_auth()
+    if _token_verifier is not None and _auth_settings is not None:
+        _mcp_kwargs["token_verifier"] = _token_verifier
+        _mcp_kwargs["auth"] = _auth_settings
+
 mcp = FastMCP(
     "influencers-club",
     instructions=(

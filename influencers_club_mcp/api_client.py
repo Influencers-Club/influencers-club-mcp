@@ -90,20 +90,32 @@ class InfluencersApiClient:
             env_key = env_key[7:].strip()
         self._env_api_key = env_key  # may be empty in HTTP mode
 
+        # In OAuth (HTTP) mode the API base MUST be the same dashboard that issues
+        # tokens, so an exchanged token's audience matches. Defaults to prod.
+        self._base_url = os.environ.get("OAUTH_API_BASE", BASE_URL).rstrip("/")
+        self._oauth_client_id = os.environ.get("MCP_OAUTH_CLIENT_ID", "")
+        self._oauth_client_secret = os.environ.get("MCP_OAUTH_CLIENT_SECRET", "")
+        # Per-subject-token cache of exchanged dashboard tokens:
+        # {user_token: (dashboard_token, monotonic_expiry)}.
+        self._exchange_cache: dict[str, tuple[str, float]] = {}
+
         max_rate = int(os.environ.get("MAX_CALLS_PER_MINUTE", str(RATE_LIMIT)))
         self._rate_limiter = _SlidingWindowRateLimiter(max_rate, RATE_WINDOW)
         self._client: httpx.AsyncClient | None = None
 
-    def _resolve_token(self) -> str:
-        """Resolve the bearer token for the current request.
+    async def _resolve_token(self) -> str:
+        """Resolve the bearer token to send to the dashboard API.
 
-        Order: per-request OAuth access token → env var fallback.
-        Raises if neither is available.
+        OAuth (HTTP) mode: the per-request access token is the user's MCP-audience
+        token; per RFC 8693 we MUST NOT forward it to the API. Instead we exchange
+        it (as a confidential client) for a separate dashboard-audience token and
+        send that. stdio mode: fall back to the single env API key.
         """
         access_token = get_access_token()
         if access_token and access_token.token:
             tok = access_token.token
-            return tok[7:].strip() if tok.startswith("Bearer ") else tok
+            user_token = tok[7:].strip() if tok.startswith("Bearer ") else tok
+            return await self._exchange_token(user_token)
         if self._env_api_key:
             return self._env_api_key
         raise ApiError(
@@ -112,19 +124,58 @@ class InfluencersApiClient:
             "or authenticate via OAuth (HTTP).",
         )
 
+    async def _exchange_token(self, user_token: str) -> str:
+        """Exchange the user's MCP-audience token for a dashboard-audience token
+        (RFC 8693 token exchange), authenticating as the MCP confidential client.
+        Cached per user token until shortly before the exchanged token expires."""
+        now = time.monotonic()
+        hit = self._exchange_cache.get(user_token)
+        if hit and hit[1] > now:
+            return hit[0]
+        if not self._oauth_client_id or not self._oauth_client_secret:
+            raise ApiError(
+                500,
+                "OAuth client credentials not configured (MCP_OAUTH_CLIENT_ID / "
+                "MCP_OAUTH_CLIENT_SECRET) — cannot exchange the user token.",
+            )
+        client = await self._get_client()
+        try:
+            resp = await client.post(
+                "/public/v1/oauth/token/",
+                data={
+                    "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
+                    "client_id": self._oauth_client_id,
+                    "client_secret": self._oauth_client_secret,
+                    "subject_token": user_token,
+                    "subject_token_type": "urn:ietf:params:oauth:token-type:access_token",
+                },
+                timeout=DEFAULT_TIMEOUT,
+            )
+            resp.raise_for_status()
+            payload = resp.json()
+        except Exception as e:
+            raise self._handle_error(e) from e
+        dash_token = payload.get("access_token")
+        if not dash_token:
+            raise ApiError(502, "Token exchange returned no access_token.")
+        # Re-exchange ~30s before expiry so we never send a just-expired token.
+        ttl = max(int(payload.get("expires_in") or 0) - 30, 0)
+        self._exchange_cache[user_token] = (dash_token, now + ttl)
+        return dash_token
+
     async def _get_client(self) -> httpx.AsyncClient:
         """Return a shared AsyncClient, creating it lazily on first use."""
         if self._client is None or self._client.is_closed:
             self._client = httpx.AsyncClient(
-                base_url=BASE_URL,
+                base_url=self._base_url,
                 headers={"Accept": "application/json"},
                 timeout=DEFAULT_TIMEOUT,
             )
         return self._client
 
-    def _headers(self) -> dict[str, str]:
+    async def _headers(self) -> dict[str, str]:
         return {
-            "Authorization": f"Bearer {self._resolve_token()}",
+            "Authorization": f"Bearer {await self._resolve_token()}",
             "Accept": "application/json",
         }
 
@@ -159,7 +210,7 @@ class InfluencersApiClient:
             resp = await client.get(
                 path,
                 params=params,
-                headers=self._headers(),
+                headers=await self._headers(),
                 timeout=timeout,
             )
             _log(f"GET {path} -> {resp.status_code}")
@@ -180,7 +231,7 @@ class InfluencersApiClient:
             resp = await client.post(
                 path,
                 json=body,
-                headers={**self._headers(), "Content-Type": "application/json"},
+                headers={**(await self._headers()), "Content-Type": "application/json"},
                 timeout=timeout,
             )
             _log(f"POST {path} -> {resp.status_code}")
@@ -201,7 +252,7 @@ class InfluencersApiClient:
                 path,
                 files=files,
                 data=data,
-                headers=self._headers(),
+                headers=await self._headers(),
                 timeout=timeout,
             )
             _log(f"POST {path} -> {resp.status_code}")
