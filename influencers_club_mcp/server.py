@@ -939,7 +939,7 @@ async def enrich_by_email(
 # ═══════════════════════════════════════════════════════════════════════
 # 18. CREATE BATCH ENRICHMENT
 # ═══════════════════════════════════════════════════════════════════════
-@mcp.tool(
+@stdio_only_tool(
     name="create_batch_enrichment",
     annotations={"title": "Create Batch Enrichment", "readOnlyHint": False, "destructiveHint": False, "openWorldHint": True},
 )
@@ -1215,7 +1215,7 @@ def _evict_stale_polls() -> None:
         _batch_poll_cache.pop(bid, None)
 
 
-@mcp.tool(
+@stdio_only_tool(
     name="get_batch_status",
     annotations={"title": "Get Batch Status", "readOnlyHint": True, "destructiveHint": False, "openWorldHint": True},
 )
@@ -1284,7 +1284,7 @@ async def get_batch_status(
 # ═══════════════════════════════════════════════════════════════════════
 # 20. BATCH DOWNLOAD
 # ═══════════════════════════════════════════════════════════════════════
-@mcp.tool(
+@stdio_only_tool(
     name="download_batch_results",
     annotations={"title": "Download Batch Results", "readOnlyHint": False, "destructiveHint": False, "openWorldHint": True},
 )
@@ -1385,7 +1385,7 @@ async def download_batch_results(
 # ═══════════════════════════════════════════════════════════════════════
 # 21. RESUME BATCH
 # ═══════════════════════════════════════════════════════════════════════
-@mcp.tool(
+@stdio_only_tool(
     name="resume_batch",
     annotations={"title": "Resume Batch", "readOnlyHint": False, "destructiveHint": False, "openWorldHint": True},
 )
