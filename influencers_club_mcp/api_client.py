@@ -13,6 +13,8 @@ from typing import Any
 
 import httpx
 
+from .oauth_config import load_oauth_config
+
 try:
     # Available when running under FastMCP HTTP transport with auth wired up.
     # In stdio mode this import succeeds but get_access_token() returns None.
@@ -21,7 +23,6 @@ except Exception:  # pragma: no cover — defensive against package layout drift
     def get_access_token():  # type: ignore[misc]
         return None
 
-BASE_URL = "https://api-dashboard.influencers.club"
 DEFAULT_TIMEOUT = 30.0
 BATCH_TIMEOUT = 60.0
 RATE_LIMIT = 300  # requests per minute
@@ -90,17 +91,13 @@ class InfluencersApiClient:
             env_key = env_key[7:].strip()
         self._env_api_key = env_key  # may be empty in HTTP mode
 
-        # In OAuth (HTTP) mode the API base MUST be the same dashboard that issues
-        # tokens, so an exchanged token's audience matches. Falls back to the issuer
-        # (mirrors build_auth) before the prod default, so configuring only
-        # OAUTH_ISSUER_URL still points calls + token-exchange at the right host.
-        self._base_url = (
-            os.environ.get("OAUTH_API_BASE")
-            or os.environ.get("OAUTH_ISSUER_URL")
-            or BASE_URL
-        ).rstrip("/")
-        self._oauth_client_id = os.environ.get("MCP_OAUTH_CLIENT_ID", "")
-        self._oauth_client_secret = os.environ.get("MCP_OAUTH_CLIENT_SECRET", "")
+        # OAuth (HTTP) mode: the dashboard base + confidential client come from the
+        # shared resolver, so introspection (auth), token-exchange and API calls
+        # always target the same host with the same credentials.
+        _oauth = load_oauth_config()
+        self._base_url = _oauth.api_base
+        self._oauth_client_id = _oauth.client_id
+        self._oauth_client_secret = _oauth.client_secret
         # Per-subject-token cache of exchanged dashboard tokens:
         # {user_token: (dashboard_token, monotonic_expiry)}.
         self._exchange_cache: dict[str, tuple[str, float]] = {}

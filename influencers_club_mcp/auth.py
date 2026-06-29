@@ -24,7 +24,6 @@ are unaffected.
 
 from __future__ import annotations
 
-import os
 import sys
 import time
 
@@ -32,14 +31,10 @@ import httpx
 from mcp.server.auth.provider import AccessToken, TokenVerifier
 from mcp.server.auth.settings import AuthSettings
 
-# The IC dashboard doubles as the OAuth authorization server and the API host.
-_DEFAULT_ISSUER = "https://api-dashboard.influencers.club"
+from .oauth_config import load_oauth_config
+
 # RFC 7662 token-introspection endpoint on the dashboard.
 _INTROSPECT_PATH = "/public/v1/oauth/introspect/"
-
-
-def _truthy(name: str) -> bool:
-    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
 
 
 def _log(msg: str) -> None:
@@ -162,36 +157,31 @@ def build_auth() -> tuple[ICTokenVerifier | None, AuthSettings | None]:
     introspection call will be rejected by the dashboard (fail-closed), which makes
     the misconfiguration loud rather than silently disabling auth.
     """
-    if not _truthy("MCP_OAUTH_ENABLED"):
+    cfg = load_oauth_config()
+    if not cfg.enabled:
         return None, None
 
-    issuer = os.environ.get("OAUTH_ISSUER_URL", _DEFAULT_ISSUER).rstrip("/")
-    api_base = os.environ.get("OAUTH_API_BASE", issuer).rstrip("/")
-    resource = os.environ.get("OAUTH_RESOURCE_URL", "http://localhost:8000/mcp")
-    client_id = os.environ.get("MCP_OAUTH_CLIENT_ID", "")
-    client_secret = os.environ.get("MCP_OAUTH_CLIENT_SECRET", "")
-    scopes = [s.strip() for s in os.environ.get("OAUTH_SCOPES", "").split(",") if s.strip()]
-    try:
-        ttl = float(os.environ.get("OAUTH_CACHE_TTL", "60"))
-    except ValueError:
-        ttl = 60.0
-
-    if not client_id or not client_secret:
+    if not cfg.client_id or not cfg.client_secret:
         _log(
             "WARNING: MCP_OAUTH_ENABLED but MCP_OAUTH_CLIENT_ID/SECRET are not set — "
             "introspection will fail closed (all tokens rejected)."
         )
 
     verifier = ICTokenVerifier(
-        api_base, client_id, client_secret, resource, scopes, cache_ttl=ttl
+        cfg.api_base,
+        cfg.client_id,
+        cfg.client_secret,
+        cfg.resource,
+        cfg.scopes,
+        cache_ttl=cfg.cache_ttl,
     )
     settings = AuthSettings(
-        issuer_url=issuer,
-        resource_server_url=resource,
-        required_scopes=scopes or None,
+        issuer_url=cfg.issuer,
+        resource_server_url=cfg.resource,
+        required_scopes=cfg.scopes or None,
     )
     _log(
-        f"OAuth enabled — issuer={issuer} resource={resource} "
-        f"required_scopes={scopes or '(none)'}"
+        f"OAuth enabled — issuer={cfg.issuer} resource={cfg.resource} "
+        f"required_scopes={cfg.scopes or '(none)'}"
     )
     return verifier, settings
