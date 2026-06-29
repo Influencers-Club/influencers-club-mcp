@@ -110,16 +110,21 @@ class ICTokenVerifier(TokenVerifier):
             return None
 
         # MUST validate the token was issued for THIS resource server (RFC 8707 /
-        # MCP spec). The dashboard reports the bound resource as `aud`.
-        if data.get("aud") != self._resource:
+        # MCP spec). The dashboard reports the bound resource as `aud`, which per
+        # RFC 7662 may be a single string OR a list of strings.
+        aud = data.get("aud")
+        audiences = [aud] if isinstance(aud, str) else (aud or [])
+        if self._resource not in audiences:
             _log(
-                f"token audience {data.get('aud')!r} != our resource "
+                f"token audience {aud!r} != our resource "
                 f"{self._resource!r}; rejecting"
             )
             return None
 
+        # Use exactly the scopes introspection granted — never fall back to the
+        # configured scopes, or a no-scope token would look authorized for them.
         scope_str = data.get("scope") or ""
-        scopes = scope_str.split() or self._scopes
+        scopes = scope_str.split()
         exp = data.get("exp")
         access = AccessToken(
             token=token,

@@ -91,8 +91,14 @@ class InfluencersApiClient:
         self._env_api_key = env_key  # may be empty in HTTP mode
 
         # In OAuth (HTTP) mode the API base MUST be the same dashboard that issues
-        # tokens, so an exchanged token's audience matches. Defaults to prod.
-        self._base_url = os.environ.get("OAUTH_API_BASE", BASE_URL).rstrip("/")
+        # tokens, so an exchanged token's audience matches. Falls back to the issuer
+        # (mirrors build_auth) before the prod default, so configuring only
+        # OAUTH_ISSUER_URL still points calls + token-exchange at the right host.
+        self._base_url = (
+            os.environ.get("OAUTH_API_BASE")
+            or os.environ.get("OAUTH_ISSUER_URL")
+            or BASE_URL
+        ).rstrip("/")
         self._oauth_client_id = os.environ.get("MCP_OAUTH_CLIENT_ID", "")
         self._oauth_client_secret = os.environ.get("MCP_OAUTH_CLIENT_SECRET", "")
         # Per-subject-token cache of exchanged dashboard tokens:
