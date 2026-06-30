@@ -210,13 +210,18 @@ if HTTP_MODE:
     async def healthcheck(_request: Request) -> JSONResponse:
         return JSONResponse({"status": "ok"})
 
-    # OAuth authorization-server metadata. Claude's connector probes for AS metadata
-    # ON THE MCP HOST (RFC 8414 on the resource origin); FastMCP only serves the
-    # protected-resource metadata, so the probe 404s and Claude falls back to
-    # <host>/authorize -> 404, killing the flow before consent. We serve it here,
-    # advertising the DASHBOARD's real endpoints, so Claude uses the dashboard
-    # directly (no proxy; the dashboard stays the AS and does all consent + tokens).
+    # OAuth glue for the Claude.ai connector. Claude looks for the AS metadata AND
+    # the authorize/token/register endpoints ON THE MCP HOST (same-origin as the
+    # resource); FastMCP serves none of these, so the flow 404s before consent. We
+    # serve the AS metadata advertising this host's own endpoints, then redirect/
+    # proxy those to the dashboard (the real AS, reached the same way auth.py's
+    # introspection already reaches it). The dashboard runs consent and mints +
+    # validates every token; the MCP only forwards the OAuth protocol messages
+    # (no token passthrough), so it stays a plain resource server.
+    import httpx
+
     from urllib.parse import urlsplit as _urlsplit
+    from starlette.responses import RedirectResponse, Response
 
     from .oauth_config import load_oauth_config as _load_oauth_config
 
@@ -230,9 +235,9 @@ if HTTP_MODE:
         return JSONResponse(
             {
                 "issuer": _MCP_ORIGIN,
-                "authorization_endpoint": f"{_DASH}/public/v1/oauth/authorize/",
-                "token_endpoint": f"{_DASH}/public/v1/oauth/token/",
-                "registration_endpoint": f"{_DASH}/public/v1/oauth/register/",
+                "authorization_endpoint": f"{_MCP_ORIGIN}/authorize",
+                "token_endpoint": f"{_MCP_ORIGIN}/token",
+                "registration_endpoint": f"{_MCP_ORIGIN}/register",
                 "response_types_supported": ["code"],
                 "grant_types_supported": ["authorization_code", "refresh_token"],
                 "code_challenge_methods_supported": ["S256"],
@@ -244,6 +249,34 @@ if HTTP_MODE:
                 "Cache-Control": "public, max-age=3600",
             },
         )
+
+    @mcp.custom_route("/authorize", methods=["GET"])
+    async def oauth_authorize(request: Request) -> RedirectResponse:
+        # Browser-facing: hand off to the dashboard's real authorize endpoint,
+        # preserving client_id / PKCE / redirect_uri / state / resource.
+        target = f"{_DASH}/public/v1/oauth/authorize/"
+        if request.url.query:
+            target = f"{target}?{request.url.query}"
+        return RedirectResponse(url=target, status_code=302)
+
+    async def _proxy_post(request: Request, path: str) -> Response:
+        body = await request.body()
+        ct = request.headers.get("content-type", "application/x-www-form-urlencoded")
+        async with httpx.AsyncClient(timeout=30.0) as http:
+            r = await http.post(f"{_DASH}{path}", content=body, headers={"Content-Type": ct})
+        return Response(
+            content=r.content,
+            status_code=r.status_code,
+            media_type=r.headers.get("content-type", "application/json"),
+        )
+
+    @mcp.custom_route("/token", methods=["POST"])
+    async def oauth_token(request: Request) -> Response:
+        return await _proxy_post(request, "/public/v1/oauth/token/")
+
+    @mcp.custom_route("/register", methods=["POST"])
+    async def oauth_register(request: Request) -> Response:
+        return await _proxy_post(request, "/public/v1/oauth/register/")
 
 client = InfluencersApiClient()
 
