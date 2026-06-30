@@ -210,6 +210,41 @@ if HTTP_MODE:
     async def healthcheck(_request: Request) -> JSONResponse:
         return JSONResponse({"status": "ok"})
 
+    # OAuth authorization-server metadata. Claude's connector probes for AS metadata
+    # ON THE MCP HOST (RFC 8414 on the resource origin); FastMCP only serves the
+    # protected-resource metadata, so the probe 404s and Claude falls back to
+    # <host>/authorize -> 404, killing the flow before consent. We serve it here,
+    # advertising the DASHBOARD's real endpoints, so Claude uses the dashboard
+    # directly (no proxy; the dashboard stays the AS and does all consent + tokens).
+    from urllib.parse import urlsplit as _urlsplit
+
+    from .oauth_config import load_oauth_config as _load_oauth_config
+
+    _oauth = _load_oauth_config()
+    _DASH = _oauth.api_base.rstrip("/")
+    _u = _urlsplit(_oauth.resource)
+    _MCP_ORIGIN = f"{_u.scheme}://{_u.netloc}"
+
+    @mcp.custom_route("/.well-known/oauth-authorization-server", methods=["GET"])
+    async def oauth_authorization_server(_request: Request) -> JSONResponse:
+        return JSONResponse(
+            {
+                "issuer": _MCP_ORIGIN,
+                "authorization_endpoint": f"{_DASH}/public/v1/oauth/authorize/",
+                "token_endpoint": f"{_DASH}/public/v1/oauth/token/",
+                "registration_endpoint": f"{_DASH}/public/v1/oauth/register/",
+                "response_types_supported": ["code"],
+                "grant_types_supported": ["authorization_code", "refresh_token"],
+                "code_challenge_methods_supported": ["S256"],
+                "token_endpoint_auth_methods_supported": ["none"],
+                "scopes_supported": _oauth.scopes or ["all"],
+            },
+            headers={
+                "Access-Control-Allow-Origin": "*",
+                "Cache-Control": "public, max-age=3600",
+            },
+        )
+
 client = InfluencersApiClient()
 
 
