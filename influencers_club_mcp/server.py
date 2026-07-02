@@ -65,7 +65,16 @@ DISCOVERY_PLATFORMS = ("instagram", "youtube", "tiktok", "twitch", "twitter", "o
 ENRICHMENT_PLATFORMS = DISCOVERY_PLATFORMS
 CONTENT_PLATFORMS = ("instagram", "tiktok", "youtube")
 OVERLAP_PLATFORMS = ("instagram", "tiktok", "youtube")
-VALID_SORT_BY = ("relevancy", "engagement_rate", "number_of_followers", "growth_rate", "cqi", "creator_quality_index")
+# find_similar: the discovery API has no Twitter "similar" schema — 5 platforms only.
+SIMILAR_PLATFORMS = ("instagram", "youtube", "tiktok", "twitch", "onlyfans")
+# Connected-socials + raw handle enrichment accept a wider set (11) than discovery.
+SOCIAL_PLATFORMS = (
+    "instagram", "youtube", "tiktok", "onlyfans", "twitter",
+    "snapchat", "discord", "pinterest", "facebook", "linkedin", "twitch",
+)
+# Full enrichment intentionally steers linkedin to the cheaper raw endpoint.
+ENRICH_FULL_PLATFORMS = tuple(p for p in SOCIAL_PLATFORMS if p != "linkedin")
+VALID_SORT_BY = ("relevancy", "engagement_rate", "number_of_followers", "growth_rate")
 
 CREDIT_COSTS = {
     "discovery": 0.01, "similar": 0.01, "overlap": 1, "socials": 0.5,
@@ -101,91 +110,47 @@ if HTTP_MODE:
     _mcp_kwargs["port"] = int(os.environ.get("MCP_PORT", "8000"))
     _mcp_kwargs["streamable_http_path"] = os.environ.get("MCP_PATH", "/mcp")
 
+    # OAuth 2.1 resource-server mode (opt-in via MCP_OAUTH_ENABLED). Validates
+    # dashboard-issued access tokens; the SDK then auto-serves the protected-
+    # resource metadata + 401 WWW-Authenticate discovery that Claude needs.
+    # When disabled, behaviour is unchanged (single shared env token).
+    from .auth import build_auth
+
+    _token_verifier, _auth_settings = build_auth()
+    if _token_verifier is not None and _auth_settings is not None:
+        _mcp_kwargs["token_verifier"] = _token_verifier
+        _mcp_kwargs["auth"] = _auth_settings
+
 mcp = FastMCP(
     "influencers-club",
     instructions=(
-        "MCP server for the Influencers Club API - creator enrichment, discovery, content, and batch operations.\n\n"
-        "RESPONSE STYLE: Maximum 1-2 sentences. No bullet lists. No options. No summaries. "
-        "Do the task, report result in one line. Never explain what you're about to do. Never offer alternatives. "
-        "If a tool returns an error with a user_message, reply with ONLY that message — nothing added.\n\n"
-        "⛔ RATE LIMIT / QUOTA ERRORS: If ANY enrichment call returns a limit/quota error "
-        "(e.g. 'You've hit your limit'), STOP IMMEDIATELY. Do NOT retry. Do NOT continue with remaining items. "
-        "Report the error to the user and tell them how many were completed vs remaining. "
-        "This applies to both single calls and parallel agent batches.\n\n"
-        "⛔⛔⛔ MANDATORY RULE — BULK ENRICHMENT LIMIT (Claude Desktop / claude.ai ONLY) ⛔⛔⛔\n"
-        "This rule applies ONLY when you are running inside Claude Desktop or claude.ai (i.e. you do NOT have access to Agent tool, Bash tool, or file-system tools).\n"
-        "If a user provides MORE THAN 10 handles or emails to enrich (CSV file, pasted list, or any bulk request):\n"
-        "DO NOT attempt to enrich them one by one. DO NOT read the file. DO NOT ask questions.\n"
-        "IMMEDIATELY reply with ONLY this message and NOTHING else:\n"
-        "\"Bulk enrichment (more than 10 items) only works in Claude Code. "
-        "Open Claude Code and drop your file there — it handles everything automatically.\"\n"
-        "No alternatives. No offers to 'do a few'. No bullet points. Just that message. Stop.\n"
-        "If you ARE in Claude Code (you have Agent, Bash, Read, Write tools), IGNORE this block and proceed:\n"
-        "11-99 items → read the file, run parallel enrich calls via agents. 100+ items → use the batch upload flow.\n"
-        "⛔⛔⛔ END MANDATORY RULE ⛔⛔⛔\n\n"
-        "IMPORTANT: Do NOT guess or invent parameter names. Always use the exact parameter names from the tool schema.\n\n"
-        "SORTING RULES (critical — let the API sort, never re-sort client-side):\n"
-        "- sort_by options: relevancy, engagement_rate, number_of_followers, growth_rate, cqi, creator_quality_index\n"
-        "- If the user asks for 'top by followers' or 'most followed' → use sort_by='number_of_followers'\n"
-        "- If the user asks for 'best engagement' → use sort_by='engagement_rate'\n"
-        "- If the user asks for 'fastest growing' → use sort_by='growth_rate' (only works on instagram, tiktok, youtube)\n"
-        "- If the user asks for 'best quality' or 'highest quality' → use sort_by='cqi' (Creator Quality Index)\n"
-        "- sort_by='number_of_followers' is NOT available on OnlyFans\n"
-        "- sort_by='relevancy' only supports sort_order='desc' (asc will error)\n"
-        "- ai_search CAN be combined with any sort_by — use both when the user wants a topic + specific sort\n"
-        "- If sorting is not mentioned by the user, default to sort_by='relevancy'\n"
-        "- NEVER re-sort or reorder results — always present them in the exact order the API returns them\n\n"
-        "PAGINATION: Pages are 0-indexed (first page = 0, second page = 1, etc.)\n\n"
-        "LIMIT RULES (critical — every result costs credits, never fetch more than needed):\n"
-        "- Set limit to EXACTLY the number the user asks for. '1 creator' = limit=1, '3 creators' = limit=3.\n"
-        "- If the user doesn't specify a number, default to limit=5 (not 10, not 50).\n"
-        "- Maximum limit per request is 50. If the user wants more than 50, make multiple calls:\n"
-        "  e.g. 60 creators = first call limit=50 page=0, second call limit=10 page=1.\n"
-        "- Each discovery result costs 0.01 credits. Fetching 50 when user wants 1 wastes 0.49 credits.\n\n"
-        "DISCOVERY RULES (critical — ask before spending credits):\n"
-        "- ALWAYS ask the user which PLATFORM they want BEFORE running discover_creators. Never assume or search all platforms.\n"
-        "- ALWAYS ask how many results they want BEFORE searching. Default suggestion: 5.\n"
-        "- Each discovery result costs 0.01 credits. Do NOT run multiple platform searches unless explicitly asked.\n"
-        "- If the user says 'find AI marketing creators', ask: 'Which platform? (Instagram, TikTok, YouTube, Twitter, Twitch, OnlyFans)'\n"
-        "- Only after the user answers, run ONE discover_creators call with that platform.\n\n"
+        "MCP server for the Influencers Club API: creator discovery, enrichment, content, and batch operations.\n\n"
+        "Response style: keep replies short — do the task and report the result in a line or two. "
+        "If a tool returns an error with a user_message, relay just that message.\n\n"
+        "Rate limits: if an enrichment call returns a limit/quota error, stop and report how many items "
+        "completed rather than retrying — this applies to single calls and parallel batches alike.\n\n"
+        "Bulk enrichment (more than ~10 handles or emails) is best handled in Claude Code, which has a "
+        "dedicated batch flow. On Claude Desktop or claude.ai, let the user know bulk works best there.\n\n"
+        "Use the exact parameter names from each tool's schema.\n\n"
+        "Sorting: sort_by options are relevancy, engagement_rate, number_of_followers, and growth_rate "
+        "(growth_rate only on instagram/tiktok/youtube; number_of_followers not on OnlyFans; relevancy is "
+        "desc-only). Default to relevancy when unspecified. ai_search combines with any sort_by. Present "
+        "results in the order the API returns them — don't re-sort.\n\n"
+        "Pagination: pages are 0-indexed (first page = 0).\n\n"
+        "Credits & limits: every discovery/enrichment result costs credits, so fetch only what's needed. "
+        "Set limit to the number the user asked for (default 5, max 50 per request; paginate for more), and "
+        "confirm the platform and result count before a discovery search.\n\n"
         "Key tools:\n"
-        "- discover_creators: Use 'ai_search' for niche/topic queries (e.g. 'retro videogames'). "
-        "Pass the user's exact words as-is — do NOT add synonyms, expand, or rephrase the query. "
-        "ai_search can be combined with any sort_by value. "
-        "Only use 'hashtags' or 'keywords_in_bio' when the user explicitly specifies them.\n"
-        "- discover_creators_to_file: Same as discover_creators but saves results to CSV on disk. "
-        "Use when the user wants to save, export, or download a list.\n"
-        "- find_similar_creators: Find creators similar to a given creator. Present results in a table. Do NOT offer CSV/file export — it does not exist.\n"
-        "- enrich_by_handle: Use for handle lookups. Parameters are 'handle' and 'platform'.\n"
-        "- enrich_by_email: Basic email lookup (0.05 credits).\n"
-        "- create_batch_enrichment: For bulk processing. CSV must have 'handle' or 'email' header, one value per line.\n\n"
-        "ENRICHMENT ROUTING (Claude Code only — choose method based on count):\n"
-        "EMAIL enrichment:\n"
-        "- 1-10 emails: Use enrich_by_email ONE BY ONE. Call the tool once per email.\n"
-        "- 11-99 emails: Read the CSV directly, spawn parallel agents each calling enrich_by_email concurrently.\n"
-        "- 100+ emails: Use the UPLOAD FLOW (see below).\n"
-        "- If the user says 'enrich emails' but hasn't provided any yet, just say 'Send me the emails' and wait.\n"
-        "HANDLE enrichment:\n"
-        "- 1-10 handles: Use enrich_by_handle or enrich_by_handle_raw ONE BY ONE. Ask platform first.\n"
-        "- 11-99 handles: Read the CSV directly, spawn parallel agents each calling enrich_by_handle or enrich_by_handle_raw concurrently. Ask platform and mode (raw/full) first.\n"
-        "- 100+ handles: Use the UPLOAD FLOW (see below).\n\n"
-        "BATCH RULES (Claude Code only — non-Claude Code clients: see MANDATORY FIRST CHECK above):\n"
-        "- You are a MESSENGER. Pass CSV content to the API as-is. Do NOT clean, repair, deduplicate, or filter CSVs.\n"
-        "- UPLOAD FLOW (100+ emails or 100+ handles):\n"
-        "  1. Call get_upload_url → show URL to user\n"
-        "  2. IMMEDIATELY call wait_for_upload (do NOT wait for user to respond — call it right away)\n"
-        "  3. wait_for_upload auto-detects the file → returns filename and host_path\n"
-        "  4. Call create_batch_enrichment with csv_file_path from wait_for_upload (leave enrichment_mode empty)\n"
-        "  5. Server returns mode menu → present to user → user picks\n"
-        "  6. Call create_batch_enrichment AGAIN with same csv_file_path + chosen enrichment_mode\n"
-        "  NEVER skip steps. NEVER pass file contents as csv_content. NEVER run scripts.\n"
-        "- For email-based modes (basic): exclude_platforms and min_followers are optional extras.\n"
-        "  Only ask about them if the user mentions filtering. Do NOT proactively ask.\n"
-        "- For handle-based modes (raw/full): platform IS required — ask the user.\n"
-        "- AUTOMATIC POLLING: After batch submission, IMMEDIATELY start polling get_batch_status every 35s.\n"
-        "  Do NOT ask the user 'want me to keep polling?' — just keep polling automatically until finished.\n"
-        "  When finished, IMMEDIATELY call download_batch_results. The entire flow after mode selection is hands-free.\n"
-        "- download_batch_results: Only call it ONCE. Report the file path and STOP.\n"
+        "- discover_creators: use 'ai_search' for niche/topic queries, passing the user's words as-is "
+        "(no synonyms or rephrasing). Use 'hashtags' or 'keywords_in_bio' only when the user specifies them.\n"
+        "- discover_creators_to_file: same as discover_creators but saves results to CSV on disk.\n"
+        "- find_similar_creators: creators similar to a given one; present as a table (no CSV export exists).\n"
+        "- enrich_by_handle / enrich_by_handle_raw: single-profile lookup by handle + platform.\n"
+        "- enrich_by_email: single email lookup.\n"
+        "- create_batch_enrichment: bulk jobs; the CSV needs a 'handle' or 'email' header.\n\n"
+        "Batch upload flow (large jobs): get_upload_url → wait_for_upload → create_batch_enrichment "
+        "(the first call returns a mode menu; call again with the chosen mode) → poll get_batch_status → "
+        "download_batch_results once. Pass CSV content through unmodified.\n"
     ),
     **_mcp_kwargs,
 )
@@ -198,6 +163,74 @@ if HTTP_MODE:
     @mcp.custom_route("/healthcheck/", methods=["GET"])
     async def healthcheck(_request: Request) -> JSONResponse:
         return JSONResponse({"status": "ok"})
+
+    # OAuth glue for the Claude.ai connector. Claude looks for the AS metadata AND
+    # the authorize/token/register endpoints ON THE MCP HOST (same-origin as the
+    # resource); FastMCP serves none of these, so the flow 404s before consent. We
+    # serve the AS metadata advertising this host's own endpoints, then redirect/
+    # proxy those to the dashboard (the real AS, reached the same way auth.py's
+    # introspection already reaches it). The dashboard runs consent and mints +
+    # validates every token; the MCP only forwards the OAuth protocol messages
+    # (no token passthrough), so it stays a plain resource server.
+    import httpx
+
+    from urllib.parse import urlsplit as _urlsplit
+    from starlette.responses import RedirectResponse, Response
+
+    from .oauth_config import load_oauth_config as _load_oauth_config
+
+    _oauth = _load_oauth_config()
+    _DASH = _oauth.api_base.rstrip("/")
+    _u = _urlsplit(_oauth.resource)
+    _MCP_ORIGIN = f"{_u.scheme}://{_u.netloc}"
+
+    @mcp.custom_route("/.well-known/oauth-authorization-server", methods=["GET"])
+    async def oauth_authorization_server(_request: Request) -> JSONResponse:
+        return JSONResponse(
+            {
+                "issuer": _MCP_ORIGIN,
+                "authorization_endpoint": f"{_MCP_ORIGIN}/authorize",
+                "token_endpoint": f"{_MCP_ORIGIN}/token",
+                "registration_endpoint": f"{_MCP_ORIGIN}/register",
+                "response_types_supported": ["code"],
+                "grant_types_supported": ["authorization_code", "refresh_token"],
+                "code_challenge_methods_supported": ["S256"],
+                "token_endpoint_auth_methods_supported": ["none"],
+                "scopes_supported": _oauth.scopes or ["all"],
+            },
+            headers={
+                "Access-Control-Allow-Origin": "*",
+                "Cache-Control": "public, max-age=3600",
+            },
+        )
+
+    @mcp.custom_route("/authorize", methods=["GET"])
+    async def oauth_authorize(request: Request) -> RedirectResponse:
+        # Browser-facing: hand off to the dashboard's real authorize endpoint,
+        # preserving client_id / PKCE / redirect_uri / state / resource.
+        target = f"{_DASH}/public/v1/oauth/authorize/"
+        if request.url.query:
+            target = f"{target}?{request.url.query}"
+        return RedirectResponse(url=target, status_code=302)
+
+    async def _proxy_post(request: Request, path: str) -> Response:
+        body = await request.body()
+        ct = request.headers.get("content-type", "application/x-www-form-urlencoded")
+        async with httpx.AsyncClient(timeout=30.0) as http:
+            r = await http.post(f"{_DASH}{path}", content=body, headers={"Content-Type": ct})
+        return Response(
+            content=r.content,
+            status_code=r.status_code,
+            media_type=r.headers.get("content-type", "application/json"),
+        )
+
+    @mcp.custom_route("/token", methods=["POST"])
+    async def oauth_token(request: Request) -> Response:
+        return await _proxy_post(request, "/public/v1/oauth/token/")
+
+    @mcp.custom_route("/register", methods=["POST"])
+    async def oauth_register(request: Request) -> Response:
+        return await _proxy_post(request, "/public/v1/oauth/register/")
 
 client = InfluencersApiClient()
 
@@ -257,6 +290,55 @@ def _parse_filters(filters_input: dict | str | None) -> dict[str, Any]:
         raise ValueError("filters must be a valid JSON object or JSON string")
 
 
+# The follower-count filter uses a different key per platform; sending the wrong
+# key makes the API silently drop the cap (unfiltered results). Callers pass a
+# single `number_of_followers` filter and we remap it to the platform's key.
+_FOLLOWER_FILTER_KEY = {
+    "instagram": "number_of_followers",
+    "tiktok": "number_of_followers",
+    "twitter": "number_of_followers",
+    "youtube": "number_of_subscribers",
+    "twitch": "followers",
+    "onlyfans": None,  # OnlyFans has no follower-count filter
+}
+
+# Common range sub-key aliases → the API's canonical {min, max}.
+_RANGE_ALIAS = {
+    "min": "min", "gte": "min", "gt": "min", "minimum": "min",
+    "max": "max", "lte": "max", "lt": "max", "maximum": "max",
+}
+
+
+def _normalize_range(value: Any, field: str) -> Any:
+    """Coerce a range filter to the API's {min,max}; map common aliases, reject the rest."""
+    if not isinstance(value, dict):
+        return value
+    out: dict[str, Any] = {}
+    for k, v in value.items():
+        canon = _RANGE_ALIAS.get(k.lower() if isinstance(k, str) else k)
+        if canon is None:
+            raise ValueError(f"'{field}' range accepts only 'min'/'max' (got '{k}').")
+        out[canon] = v
+    return out
+
+
+def _map_follower_filter(filters: dict, platform: str) -> dict:
+    """Remap the caller's `number_of_followers` filter to the correct per-platform key.
+    Without this the API silently ignores a wrong-platform follower filter."""
+    if "number_of_followers" not in filters:
+        return filters
+    target = _FOLLOWER_FILTER_KEY.get(platform)
+    if target is None:
+        raise ValueError(
+            f"{platform} has no follower-count filter — remove 'number_of_followers'."
+        )
+    filters = dict(filters)
+    filters[target] = _normalize_range(
+        filters.pop("number_of_followers"), "number_of_followers"
+    )
+    return filters
+
+
 def _validate_handle(handle: str) -> str:
     h = handle.strip()
     if not h or len(h) > 200:
@@ -307,7 +389,7 @@ def _preview_rows(data: list[dict], max_rows: int = 5) -> list[dict[str, str]]:
     for item in data[:max_rows]:
         flat: dict[str, str] = {}
         for k, v in item.items():
-            if k == "result" and isinstance(v, dict):
+            if k in ("result", "enrichment_data") and isinstance(v, dict):
                 flat.update(_flatten(v))
             elif isinstance(v, dict):
                 flat.update(_flatten(v, k))
@@ -360,8 +442,8 @@ def _json_batch_to_csv(data: Any) -> str:
         flat: dict[str, str] = {}
         # Flatten all top-level fields (input_value, status, handle, email, etc.)
         for k, v in item.items():
-            if k == "result" and isinstance(v, dict):
-                # Promote result contents to top-level (no "result." prefix)
+            if k in ("result", "enrichment_data") and isinstance(v, dict):
+                # Promote result / enrichment_data contents to top-level (no prefix)
                 flat.update(_flatten(v))
             elif isinstance(v, dict):
                 flat.update(_flatten(v, k))
@@ -438,7 +520,7 @@ async def discover_creators(
     platform: Annotated[str, Field(description="Social media platform to search (instagram, youtube, tiktok, twitch, twitter, onlyfans)")],
     page: Annotated[int, Field(description="Page number (0-indexed, first page = 0)", ge=0)] = 0,
     limit: Annotated[int, Field(description="Results per page (1-50)", ge=1, le=50)] = 20,
-    sort_by: Annotated[str, Field(description="Sort field: relevancy, engagement_rate, number_of_followers, growth_rate, cqi, or creator_quality_index. Can be combined with ai_search. growth_rate only on instagram/tiktok/youtube. number_of_followers not on onlyfans. relevancy only supports desc")] = "relevancy",
+    sort_by: Annotated[str, Field(description="Sort field: relevancy, engagement_rate, number_of_followers, growth_rate. Can be combined with ai_search. growth_rate only on instagram/tiktok/youtube. number_of_followers not on onlyfans. relevancy only supports desc")] = "relevancy",
     sort_order: Annotated[str, Field(description="Sort direction: asc or desc (relevancy only supports desc)")] = "desc",
     ai_search: Annotated[Optional[str], Field(description="AI-powered semantic search (3-150 chars). Can be combined with any sort_by. Keep queries SHORT (e.g., 'fitness', 'Claude AI'). Do NOT add extra words.")] = None,
     filters: Annotated[Optional[dict], Field(description="Optional filters object. Common: type (string - creator type filter), location (array), gender (string), number_of_followers ({min,max}), engagement_percent ({min,max}), keywords_in_bio (array of strings), is_verified (bool), keywords_in_captions (array), hashtags (array), brands (array), creator_has (object of booleans)")] = None,
@@ -450,6 +532,7 @@ async def discover_creators(
         platform = _validate_platform(platform, DISCOVERY_PLATFORMS)
         _validate_sort(sort_by, sort_order, platform)
         f = _parse_filters(filters)
+        f = _map_follower_filter(f, platform)
         if ai_search:
             ai_search = _validate_ai_search(ai_search)
             f["ai_search"] = ai_search
@@ -476,7 +559,7 @@ async def discover_creators(
 async def discover_creators_to_file(
     platform: Annotated[str, Field(description="Social media platform to search")],
     pages: Annotated[int, Field(description="Number of pages to fetch (1-10, 50 creators per page)", ge=1, le=10)] = 1,
-    sort_by: Annotated[str, Field(description="Sort field: relevancy, engagement_rate, number_of_followers, growth_rate, cqi, or creator_quality_index. Can be combined with ai_search")] = "relevancy",
+    sort_by: Annotated[str, Field(description="Sort field: relevancy, engagement_rate, number_of_followers, growth_rate. Can be combined with ai_search")] = "relevancy",
     sort_order: Annotated[str, Field(description="Sort direction: asc or desc (relevancy only supports desc)")] = "desc",
     ai_search: Annotated[Optional[str], Field(description="AI-powered semantic search (3-150 chars). Can be combined with any sort_by.")] = None,
     filters: Annotated[Optional[dict], Field(description="Optional filters object (same as discover_creators)")] = None,
@@ -491,6 +574,7 @@ async def discover_creators_to_file(
         _validate_sort(sort_by, sort_order, platform)
         total_pages = min(pages, MAX_EXPORT_PAGES)
         f = _parse_filters(filters)
+        f = _map_follower_filter(f, platform)
 
         if ai_search:
             ai_search = _validate_ai_search(ai_search)
@@ -570,7 +654,7 @@ async def discover_creators_to_file(
     annotations={"title": "Find Similar Creators", "readOnlyHint": True, "destructiveHint": False, "openWorldHint": True},
 )
 async def find_similar_creators(
-    platform: Annotated[str, Field(description="Platform of the reference creator (instagram, youtube, tiktok, twitch, twitter, onlyfans). ALWAYS ask the user — do not assume.")],
+    platform: Annotated[str, Field(description="Platform of the reference creator (instagram, youtube, tiktok, twitch, onlyfans). ALWAYS ask the user — do not assume.")],
     filter_key: Annotated[str, Field(description='How to identify the creator: "url", "username", or "id"')] = "username",
     filter_value: Annotated[str, Field(description="The creator's URL, username, or platform ID")] = "",
     filters: Annotated[Optional[dict], Field(description="Optional filters object (same filters as discover_creators)")] = None,
@@ -583,11 +667,12 @@ async def find_similar_creators(
     try:
         if not filter_value or not filter_value.strip():
             raise ValueError("filter_value is required")
-        platform = _validate_platform(platform, DISCOVERY_PLATFORMS)
+        platform = _validate_platform(platform, SIMILAR_PLATFORMS)
         if filter_key not in ("url", "username", "id"):
             raise ValueError("filter_key must be 'url', 'username', or 'id'")
         filter_value = _validate_handle(filter_value)
         f = _parse_filters(filters)
+        f = _map_follower_filter(f, platform)
 
         body: dict[str, Any] = {
             "platform": platform,
@@ -618,16 +703,9 @@ async def audience_overlap(
     Shows total followers, unique followers, and overlap percentages.
     Costs 1 credit per request.
 
-    VISUALIZATION: After presenting the data, you MUST create a diagram:
-    - 2-3 creators: Create an SVG Venn diagram. Each circle represents a creator's audience.
-      Show the creator name and follower count on each circle. Show overlap counts/percentages
-      in the intersection areas. Use distinct colors with transparency (e.g. rgba fills at 0.3 opacity)
-      so overlapping regions are visible. Include a title and legend.
-    - 4-10 creators: Create an HTML bar chart or matrix heatmap. For a bar chart, show each creator
-      as a bar with total followers, and use grouped/stacked segments to show shared vs unique audience.
-      For a heatmap, create a matrix where each cell shows the pairwise overlap percentage between
-      two creators, color-coded from light (low overlap) to dark (high overlap).
-      Include creator names as labels and overlap percentages in cells."""
+    The result suits a visual summary: a Venn diagram for 2-3 creators (one circle per creator's
+    audience, with overlap counts in the intersections), or a heatmap or bar chart for 4-10
+    (pairwise overlap percentages, or shared-vs-unique segments per creator)."""
     try:
         platform = _validate_platform(platform, OVERLAP_PLATFORMS)
         creators = [c.strip() for c in creators if c.strip()]
@@ -636,22 +714,18 @@ async def audience_overlap(
 
         result = await client.post(f"{API_V1}/creators/audience/overlap/", {"platform": platform, "creators": creators})
 
-        # Add visualization hint based on creator count
+        # Suggest a fitting visualization based on creator count
         if isinstance(result, dict):
             num_creators = len(creators)
             if num_creators <= 3:
-                result["_visualization"] = (
-                    "Create an SVG Venn diagram for this overlap data. "
-                    "Each circle = one creator's audience. Show follower counts on circles, "
-                    "overlap counts/percentages in intersections. Use distinct colors with 0.3 opacity fills. "
-                    "Make it visually clean and proportional to the data."
+                result["_visualization_hint"] = (
+                    "This overlap data suits a Venn diagram: one circle per creator's audience, "
+                    "with follower counts on the circles and overlap counts in the intersections."
                 )
             else:
-                result["_visualization"] = (
-                    "Create an HTML heatmap matrix for this overlap data. "
-                    "Rows and columns = creator names. Each cell = pairwise overlap percentage. "
-                    "Color-code cells from light (low overlap) to dark/saturated (high overlap). "
-                    "Show percentage values inside each cell. Include a color scale legend."
+                result["_visualization_hint"] = (
+                    "This overlap data suits a heatmap: creators on both axes, each cell showing the "
+                    "pairwise overlap percentage, color-scaled from low to high."
                 )
 
         return json.dumps(result, indent=2)
@@ -836,7 +910,7 @@ async def connected_socials(
     """Find all social media profiles connected to a creator. Returns linked accounts across platforms.
     Costs 0.5 credits per successful request."""
     try:
-        platform = _validate_platform(platform, ENRICHMENT_PLATFORMS)
+        platform = _validate_platform(platform, SOCIAL_PLATFORMS)
         handle = _validate_handle(handle)
         result = await client.post(f"{API_V1}/creators/socials/", {"platform": platform, "handle": handle})
         return json.dumps(result, indent=2)
@@ -860,14 +934,11 @@ async def enrich_by_handle(
 ) -> str:
     """Enrich ONE creator by handle. Costs 1 credit.
 
-    ⛔ MAX 10 HANDLES. If the user has more than 10 handles to enrich (CSV file, list, any bulk request),
-    DO NOT call this tool. Instead reply ONLY: "Bulk enrichment (more than 10) requires Claude Code.
-    Open Claude Code and drop your file there." — then stop.
-    In Claude Code: 11-99 handles → parallel agents calling this tool. 100+ → upload flow.
+    For bulk (more than ~10 handles), use create_batch_enrichment — or Claude Code's batch flow.
 
-    Use enrich_by_handle_raw (0.03 cr) for basic lookups unless user asks for full data."""
+    Use enrich_by_handle_raw (0.03 cr) for basic lookups unless the user asks for full data."""
     try:
-        platform = _validate_platform(platform, ENRICHMENT_PLATFORMS)
+        platform = _validate_platform(platform, ENRICH_FULL_PLATFORMS)
         handle = _validate_handle(handle)
         if email_required not in ("must_have", "preferred"):
             raise ValueError("email_required must be 'must_have' or 'preferred'")
@@ -897,12 +968,9 @@ async def enrich_by_handle_raw(
 ) -> str:
     """Enrich ONE creator by handle (basic). Costs 0.03 credits. Supports linkedin.
 
-    ⛔ MAX 10 HANDLES. If the user has more than 10 handles to enrich (CSV file, list, any bulk request),
-    DO NOT call this tool. Instead reply ONLY: "Bulk enrichment (more than 10) requires Claude Code.
-    Open Claude Code and drop your file there." — then stop.
-    In Claude Code: 11-99 handles → parallel agents calling this tool. 100+ → upload flow."""
+    For bulk (more than ~10 handles), use create_batch_enrichment — or Claude Code's batch flow."""
     try:
-        platform = _validate_platform(platform, (*ENRICHMENT_PLATFORMS, "linkedin"))
+        platform = _validate_platform(platform, SOCIAL_PLATFORMS)
         handle = _validate_handle(handle)
         result = await client.post(f"{API_V1}/creators/enrich/handle/raw/", {"handle": handle, "platform": platform})
         return json.dumps(result, indent=2)
@@ -922,10 +990,7 @@ async def enrich_by_email(
 ) -> str:
     """Enrich ONE email. Costs 0.05 credits.
 
-    ⛔ MAX 10 EMAILS. If the user has more than 10 emails to enrich (CSV file, list, any bulk request),
-    DO NOT call this tool. Instead reply ONLY: "Bulk enrichment (more than 10) requires Claude Code.
-    Open Claude Code and drop your file there." — then stop.
-    In Claude Code: 11-99 emails → parallel agents calling this tool. 100+ → upload flow."""
+    For bulk (more than ~10 emails), use create_batch_enrichment — or Claude Code's batch flow."""
     try:
         email = email.strip().lower()
         if not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", email):
@@ -951,21 +1016,20 @@ async def create_batch_enrichment(
     email_required: Annotated[Optional[str], Field(description="For handle modes only: must_have or preferred")] = None,
     include_lookalikes: Annotated[Optional[bool], Field(description="For handle full mode only")] = None,
     include_audience_data: Annotated[Optional[bool], Field(description="For handle full mode, IG/TT/YT only")] = None,
-    exclude_platforms: Annotated[Optional[list[str]], Field(description="For email-based modes only")] = None,
+    exclude_platforms: Annotated[Optional[str], Field(description="For email-based (basic) mode only: a single platform to exclude from matches. One of: instagram, youtube, tiktok, twitter, twitch, onlyfans")] = None,
     min_followers: Annotated[Optional[int], Field(description="For email-based modes only", ge=0)] = None,
     metadata: Annotated[Optional[Any], Field(description="Optional JSON metadata string (e.g., campaign name)")] = None,
 ) -> str:
-    """Create a batch enrichment job. Upload CSV with up to 10,000 handles or emails.
+    """Create a batch enrichment job. Upload a CSV with up to 10,000 handles or emails.
 
-    ⛔ CLAUDE DESKTOP / NON-CLAUDE-CODE CLIENTS: Call this tool IMMEDIATELY with NO parameters
-    when a user provides a CSV, list of handles, or list of emails. Do NOT read the file first.
-    Do NOT ask about platform or mode. The server will detect your client and respond.
+    On Claude Desktop / claude.ai, call this with no parameters when the user provides a CSV or list —
+    the server responds with the right next step for that client.
 
-    RULES (Claude Code only):
-    1. Leave enrichment_mode empty on first call — server returns mode menu for user to choose.
+    In Claude Code:
+    1. Leave enrichment_mode empty on the first call — the server returns a mode menu to choose from.
     2. 100+ entries: get_upload_url → user uploads → wait_for_upload → csv_file_path.
-    3. <100 entries: use parallel agents calling single enrichment tools (see ENRICHMENT ROUTING).
-    4. csv_content only for small inline lists typed in chat. NEVER for dropped/attached files."""
+    3. Fewer entries can also be enriched one at a time with the single-profile tools.
+    4. Use csv_content only for small inline lists typed in chat, not for dropped/attached files."""
     try:
         if "claude-code" not in _get_mcp_client_name().lower():
             return _claude_code_error("create_batch_enrichment")
@@ -1179,7 +1243,7 @@ async def create_batch_enrichment(
         if include_audience_data is not None:
             data["include_audience_data"] = str(include_audience_data).lower()
         if exclude_platforms:
-            data["exclude_platforms"] = json.dumps(exclude_platforms)
+            data["exclude_platforms"] = _validate_platform(exclude_platforms, ENRICHMENT_PLATFORMS)
         if min_followers is not None:
             data["min_followers"] = str(min_followers)
         if metadata:
@@ -1190,9 +1254,8 @@ async def create_batch_enrichment(
             if duplicate_warning:
                 result["duplicate_warning"] = duplicate_warning
             result["_auto_action"] = (
-                "Batch submitted. Tell the user the batch_id and that you will monitor progress. "
-                "If there is a 'duplicate_warning', show it to the user BEFORE polling. "
-                "Then IMMEDIATELY call get_batch_status with this batch_id. Do NOT ask the user — just poll."
+                "Batch submitted. Tell the user the batch_id and that you'll monitor progress. "
+                "If there's a 'duplicate_warning', show it first, then poll get_batch_status with this batch_id."
             )
         return json.dumps(result, indent=2)
     except Exception as e:
@@ -1224,12 +1287,12 @@ async def get_batch_status(
 ) -> str:
     """Check the status of a batch enrichment job. Claude Code only. Free (0 credits).
 
-    ⛔ NON-CLAUDE-CODE CLIENTS: Do NOT call this tool. Call create_batch_enrichment with no parameters instead.
+    On other clients, use create_batch_enrichment (with no parameters) instead.
 
-    Server waits 35s between polls internally. Auto-polling rules:
-    - 'processing': Report progress, call get_batch_status again immediately.
-    - 'finished': IMMEDIATELY call download_batch_results. Do NOT ask the user.
-    - 'paused_insufficient_credits': Tell user, offer resume_batch."""
+    The server waits 35s between polls internally. Handling by status:
+    - 'processing': report progress and poll again.
+    - 'finished': call download_batch_results.
+    - 'paused_insufficient_credits': tell the user and offer resume_batch."""
     import time
     try:
         if "claude-code" not in _get_mcp_client_name().lower():
@@ -1261,13 +1324,11 @@ async def get_batch_status(
             if status == "finished":
                 _batch_poll_cache.pop(batch_id, None)
                 result["_auto_action"] = (
-                    "Batch finished! IMMEDIATELY call download_batch_results with this batch_id. "
-                    "Do NOT ask the user — just download."
+                    "Batch finished — call download_batch_results with this batch_id to fetch the results."
                 )
             elif status == "processing":
                 result["_auto_action"] = (
-                    "Still processing. Report progress to user, then wait 35 seconds and "
-                    "call get_batch_status again. Do NOT ask the user whether to continue polling."
+                    "Still processing. Report progress, then poll get_batch_status again after ~35 seconds."
                 )
             elif status == "paused_insufficient_credits":
                 _batch_poll_cache.pop(batch_id, None)
@@ -1293,12 +1354,11 @@ async def download_batch_results(
 ) -> str:
     """Download batch results as CSV. Claude Code only. Free (0 credits).
 
-    ⛔ NON-CLAUDE-CODE CLIENTS: Do NOT call this tool. Call create_batch_enrichment with no parameters instead.
+    On other clients, use create_batch_enrichment (with no parameters) instead.
 
-    Saves to influencer-exports folder. Batch must be 'finished' or 'paused_insufficient_credits'.
-    Filename is auto-generated. Report path to user. Display 'preview' table.
-    PREVIEW RULE: Never include 'not_found' or failed rows in the preview table — only show successfully enriched results.
-    Do NOT enrich results individually after downloading — that wastes credits."""
+    Saves to the influencer-exports folder; the batch must be 'finished' or 'paused_insufficient_credits'.
+    The filename is auto-generated — report the path and show the 'preview' table (successfully enriched
+    rows only, not 'not_found'/failed ones). No need to re-enrich rows individually afterward — that costs credits."""
     try:
         if "claude-code" not in _get_mcp_client_name().lower():
             return _claude_code_error("download_batch_results")
@@ -1394,7 +1454,7 @@ async def resume_batch(
 ) -> str:
     """Resume a paused batch enrichment job. Claude Code only. Free (0 credits).
 
-    ⛔ NON-CLAUDE-CODE CLIENTS: Do NOT call this tool. Call create_batch_enrichment with no parameters instead."""
+    On other clients, use create_batch_enrichment (with no parameters) instead."""
     try:
         if "claude-code" not in _get_mcp_client_name().lower():
             return _claude_code_error("resume_batch")
@@ -1418,7 +1478,7 @@ async def get_creator_posts(
     platform: Annotated[str, Field(description="Platform (instagram, tiktok, or youtube)")],
     handle: Annotated[str, Field(description="Creator's username or handle")],
     count: Annotated[Optional[int], Field(description="Number of posts to retrieve (platform limits apply)", ge=1, le=50)] = None,
-    pagination_token: Annotated[Optional[str], Field(description="Cursor token from previous response for next page")] = None,
+    pagination_token: Annotated[Optional[str], Field(description="Pass the 'next_token' value from the previous response to fetch the next page")] = None,
 ) -> str:
     """Get recent posts/content from a creator. Supports Instagram (12/page), TikTok (max 35), YouTube (max 50).
     Uses cursor-based pagination. Costs 0.15 credits per request."""
@@ -1447,7 +1507,7 @@ async def get_post_details(
     platform: Annotated[str, Field(description="Platform (instagram, tiktok, or youtube)")],
     post_id: Annotated[str, Field(description="Platform-specific post/video ID (NOT a URL)")],
     content_type: Annotated[str, Field(description="Type of content: data (post info), comments, transcript, audio (no audio for YouTube)")] = "data",
-    pagination_token: Annotated[Optional[str], Field(description="Cursor token for paginating comments")] = None,
+    pagination_token: Annotated[Optional[str], Field(description="Pass the 'next_token' value from the previous response to page through comments")] = None,
 ) -> str:
     """Get detailed information about a specific post. Can retrieve post data, comments, transcript, or audio.
     Costs 0.03 credits per request."""
@@ -1497,11 +1557,10 @@ async def check_credits() -> str:
 async def get_upload_url() -> str:
     """Get the upload page URL for batch CSV upload. Claude Code only.
 
-    ⛔ NON-CLAUDE-CODE CLIENTS: Do NOT call this tool. Call create_batch_enrichment with no parameters instead.
+    On other clients, use create_batch_enrichment (with no parameters) instead.
 
-    After getting the URL, IMMEDIATELY call wait_for_upload in the SAME response.
-    Do NOT ask the user anything. Do NOT use browser automation or Chrome tools.
-    The USER opens the link and uploads the file themselves."""
+    After getting the URL, show it to the user and call wait_for_upload in the same response —
+    the user opens the link and uploads the file themselves (no browser automation needed)."""
     try:
         if "claude-code" not in _get_mcp_client_name().lower():
             return _claude_code_error("get_upload_url")
@@ -1512,12 +1571,9 @@ async def get_upload_url() -> str:
         response: dict[str, Any] = {
             "upload_url": upload_url,
             "_auto_action": (
-                "You MUST do EXACTLY two things in your NEXT response — nothing else: "
-                "1) Show the upload URL as a clickable link to the user. "
-                "2) IMMEDIATELY call wait_for_upload in the SAME response. "
-                "Do NOT ask the user anything. Do NOT say 'want me to wait?'. "
-                "Do NOT use Claude in Chrome, browser automation, navigate, or any browser tools. "
-                "The USER opens the link and uploads the file themselves. You just wait."
+                "Next response: show the upload URL as a clickable link and call wait_for_upload in the "
+                "same response. The user opens the link and uploads the file themselves — just wait for it "
+                "(no browser automation)."
             ),
         }
 
@@ -1542,9 +1598,9 @@ async def get_upload_url() -> str:
 async def wait_for_upload() -> str:
     """Wait for a file to be uploaded via the upload page. Claude Code only.
 
-    ⛔ NON-CLAUDE-CODE CLIENTS: Do NOT call this tool. Call create_batch_enrichment with no parameters instead.
+    On other clients, use create_batch_enrichment (with no parameters) instead.
 
-    Polls every 2 seconds for up to 3 minutes. Call IMMEDIATELY after get_upload_url.
+    Polls every 2 seconds for up to 3 minutes; call it right after get_upload_url.
     Returns the uploaded file details when detected. Free (0 credits)."""
     try:
         if "claude-code" not in _get_mcp_client_name().lower():
@@ -1605,7 +1661,7 @@ async def wait_for_upload() -> str:
 async def list_import_files() -> str:
     """List uploaded CSV files ready for batch enrichment. Claude Code only. Free (0 credits).
 
-    ⛔ NON-CLAUDE-CODE CLIENTS: Do NOT call this tool. Call create_batch_enrichment with no parameters instead.
+    On other clients, use create_batch_enrichment (with no parameters) instead.
 
     Shows the 5 most recent uploads. Use host_path as csv_file_path in create_batch_enrichment."""
     try:

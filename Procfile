@@ -1,0 +1,1 @@
+web: influencers-club-mcp

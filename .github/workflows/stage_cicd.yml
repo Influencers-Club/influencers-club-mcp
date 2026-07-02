@@ -34,6 +34,11 @@ jobs:
       - name: Checkout source code
         uses: actions/checkout@v6
 
+      - name: Stamp a unique build version
+        run: |
+          sed -i -E 's/^version = .*/version = "0.1.${{ github.run_number }}"/' pyproject.toml
+          grep -E '^version' pyproject.toml
+
       - name: Generate deployment package
         run: zip -r deploy_package_${{ github.sha }}.zip . -x '*.git*'
 
