@@ -228,7 +228,7 @@ class InfluencersApiClient:
     async def post(self, path: str, body: dict[str, Any], timeout: float = DEFAULT_TIMEOUT) -> Any:
         """Make a POST request with JSON body."""
         self._rate_limiter.check()
-        _log(f"POST {path} body={json.dumps(body, default=str)[:500]}")
+        _log(f"POST {path}")
         client = await self._get_client()
         try:
             resp = await client.post(
