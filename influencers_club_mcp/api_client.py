@@ -190,9 +190,15 @@ class InfluencersApiClient:
             status = e.response.status_code
             try:
                 body = e.response.json()
-                msg = (body.get("message") or body.get("detail") or body.get("error")
-                       or body.get("response_meta", {}).get("error_message")
-                       or f"API error {status}")
+                msg = None
+                if isinstance(body, dict):
+                    msg = (body.get("message") or body.get("detail") or body.get("error")
+                           or body.get("response_meta", {}).get("error_message"))
+                if not msg:
+                    # No recognized message key (e.g. DRF field-error dicts like
+                    # {"filters": {"engagement_percent": [...]}} or list bodies) —
+                    # include the body itself so the caller sees what was rejected.
+                    msg = f"API error {status}: {_sanitize(json.dumps(body, ensure_ascii=False)[:300])}"
             except Exception:
                 msg = f"API error {status}: {_sanitize(e.response.text[:200])}"
             return ApiError(status, str(msg), retryable=(status == 429 or status >= 500))
@@ -206,10 +212,11 @@ class InfluencersApiClient:
         self, path: str, params: dict[str, str] | None = None, timeout: float = DEFAULT_TIMEOUT
     ) -> Any:
         """Make a GET request."""
-        self._rate_limiter.check()
         _log(f"GET {path} params={params}")
         client = await self._get_client()
         try:
+            # Inside the try so RateLimitError normalizes to ApiError(429, retryable=True)
+            self._rate_limiter.check()
             resp = await client.get(
                 path,
                 params=params,
@@ -227,10 +234,10 @@ class InfluencersApiClient:
 
     async def post(self, path: str, body: dict[str, Any], timeout: float = DEFAULT_TIMEOUT) -> Any:
         """Make a POST request with JSON body."""
-        self._rate_limiter.check()
         _log(f"POST {path}")
         client = await self._get_client()
         try:
+            self._rate_limiter.check()
             resp = await client.post(
                 path,
                 json=body,
@@ -247,10 +254,10 @@ class InfluencersApiClient:
         self, path: str, files: dict, data: dict[str, str], timeout: float = BATCH_TIMEOUT
     ) -> Any:
         """Make a POST request with multipart/form-data (for batch uploads)."""
-        self._rate_limiter.check()
         _log(f"POST {path} (multipart) mode={data.get('enrichment_mode', '?')}")
         client = await self._get_client()
         try:
+            self._rate_limiter.check()
             resp = await client.post(
                 path,
                 files=files,
