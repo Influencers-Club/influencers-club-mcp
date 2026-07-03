@@ -15,7 +15,7 @@ from __future__ import annotations
 import json
 from typing import Any, Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 __all__ = ["DiscoveryFilters", "coerce_filters"]
 
@@ -24,9 +24,40 @@ class _Base(BaseModel):
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
 
 
+# Common range sub-key aliases → the API's canonical {min, max}. Folded in before
+# extra="forbid" runs, so a client sending {"gte": 50000} is remapped, not rejected.
+_RANGE_ALIASES = {
+    "min": "min", "gte": "min", "gt": "min", "minimum": "min",
+    "max": "max", "lte": "max", "lt": "max", "maximum": "max",
+}
+
+
 class Range(_Base):
     min: Optional[float] = None
     max: Optional[float] = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _fold_range_aliases(cls, data: Any) -> Any:
+        """Accept gte/lte/gt/lt/minimum/maximum as aliases for min/max.
+
+        Runs before field validation and extra='forbid', so aliased bounds are
+        normalized rather than rejected. Truly unknown keys still fall through to
+        extra='forbid'. Two aliases mapping to the same bound with different values
+        is a caller error, raised with the offending keys named.
+        """
+        if not isinstance(data, dict):
+            return data
+        out: dict[str, Any] = {}
+        for key, value in data.items():
+            canon = _RANGE_ALIASES.get(key.lower(), key) if isinstance(key, str) else key
+            if canon in out and out[canon] != value:
+                raise ValueError(
+                    f"range got conflicting bounds for '{canon}' via multiple aliases; "
+                    f"use only 'min'/'max'."
+                )
+            out[canon] = value
+        return out
 
 
 class Growth(_Base):
@@ -227,6 +258,11 @@ def coerce_filters(value: DiscoveryFilters | dict | str | None) -> dict[str, Any
             value = json.loads(value)
         except json.JSONDecodeError:
             raise ValueError("filters must be a JSON object, e.g. {\"number_of_followers\": {\"min\": 50000}}")
+        if value is None:  # the literal JSON string "null"
+            return {}
     if isinstance(value, dict):
         value = DiscoveryFilters.model_validate(value)
+    if not isinstance(value, DiscoveryFilters):
+        # a JSON array/scalar, or any other non-object — never a valid filter set
+        raise ValueError("filters must be a JSON object, e.g. {\"number_of_followers\": {\"min\": 50000}}")
     return value.model_dump(exclude_none=True, by_alias=True)
