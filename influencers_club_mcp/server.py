@@ -21,6 +21,7 @@ from pydantic import Field
 
 from .api_client import ApiError, InfluencersApiClient
 from .csv_export import creators_to_csv
+from .discovery_filters import DiscoveryFilters, coerce_filters
 
 # ─── Constants ─────────────────────────────────────────────────────────
 API_V1 = "/public/v1"
@@ -121,37 +122,37 @@ if HTTP_MODE:
         _mcp_kwargs["token_verifier"] = _token_verifier
         _mcp_kwargs["auth"] = _auth_settings
 
+# Server-level instructions. The hosted (HTTP) variant must only describe tools that
+# actually exist in hosted mode — batch/file tools are stdio-only, so their sections
+# are appended only for stdio. Keep wording descriptive (what tools do), not behavioral.
+_INSTRUCTIONS_CORE = (
+    "MCP server for the Influencers Club API: creator discovery, enrichment, and content analytics.\n\n"
+    "Errors: tool errors are JSON with a message field; if an error includes a user_message, "
+    "that text is written for the end user. On limit/quota errors, further calls will keep "
+    "failing until the limit resets.\n\n"
+    "Sorting: sort_by options are relevancy, engagement_rate, number_of_followers, and growth_rate "
+    "(growth_rate only on instagram/tiktok/youtube; number_of_followers not on OnlyFans; relevancy is "
+    "desc-only). Default is relevancy. For topical queries, ai_search + relevancy ranks best matches "
+    "first; a number_of_followers filter constrains audience size. Result order reflects that ranking.\n\n"
+    "Pagination: pages are 0-indexed (first page = 0).\n\n"
+    "Credits: every discovery/enrichment result costs credits (amounts are stated on each tool). "
+    "The limit parameter controls spend — it defaults to the requested amount, max 50 per request.\n\n"
+    "discover_creators: 'ai_search' does semantic niche/topic search and works best with the user's "
+    "own words. 'hashtags' and 'keywords_in_bio' are separate, literal filters.\n"
+)
+
+_INSTRUCTIONS_STDIO_EXTRAS = (
+    "\nLocal-only tools (this stdio session): discover_creators_to_file saves discovery results "
+    "to CSV on disk. Bulk enrichment runs as batch jobs: get_upload_url provides the CSV upload "
+    "page, wait_for_upload blocks until the file lands, create_batch_enrichment starts the job "
+    "(first call returns a mode menu; a second call with the chosen mode starts it), "
+    "get_batch_status reports progress, and download_batch_results fetches the output once. "
+    "The uploaded CSV needs a 'handle' or 'email' header.\n"
+)
+
 mcp = FastMCP(
     "influencers-club",
-    instructions=(
-        "MCP server for the Influencers Club API: creator discovery, enrichment, content, and batch operations.\n\n"
-        "Response style: keep replies short — do the task and report the result in a line or two. "
-        "If a tool returns an error with a user_message, relay just that message.\n\n"
-        "Rate limits: if an enrichment call returns a limit/quota error, stop and report how many items "
-        "completed rather than retrying — this applies to single calls and parallel batches alike.\n\n"
-        "Bulk enrichment (more than ~10 handles or emails) is best handled in Claude Code, which has a "
-        "dedicated batch flow. On Claude Desktop or claude.ai, let the user know bulk works best there.\n\n"
-        "Use the exact parameter names from each tool's schema.\n\n"
-        "Sorting: sort_by options are relevancy, engagement_rate, number_of_followers, and growth_rate "
-        "(growth_rate only on instagram/tiktok/youtube; number_of_followers not on OnlyFans; relevancy is "
-        "desc-only). Default to relevancy when unspecified. ai_search combines with any sort_by. Present "
-        "results in the order the API returns them — don't re-sort.\n\n"
-        "Pagination: pages are 0-indexed (first page = 0).\n\n"
-        "Credits & limits: every discovery/enrichment result costs credits, so fetch only what's needed. "
-        "Set limit to the number the user asked for (default 5, max 50 per request; paginate for more), and "
-        "confirm the platform and result count before a discovery search.\n\n"
-        "Key tools:\n"
-        "- discover_creators: use 'ai_search' for niche/topic queries, passing the user's words as-is "
-        "(no synonyms or rephrasing). Use 'hashtags' or 'keywords_in_bio' only when the user specifies them.\n"
-        "- discover_creators_to_file: same as discover_creators but saves results to CSV on disk.\n"
-        "- find_similar_creators: creators similar to a given one; present as a table (no CSV export exists).\n"
-        "- enrich_by_handle / enrich_by_handle_raw: single-profile lookup by handle + platform.\n"
-        "- enrich_by_email: single email lookup.\n"
-        "- create_batch_enrichment: bulk jobs; the CSV needs a 'handle' or 'email' header.\n\n"
-        "Batch upload flow (large jobs): get_upload_url → wait_for_upload → create_batch_enrichment "
-        "(the first call returns a mode menu; call again with the chosen mode) → poll get_batch_status → "
-        "download_batch_results once. Pass CSV content through unmodified.\n"
-    ),
+    instructions=_INSTRUCTIONS_CORE + ("" if HTTP_MODE else _INSTRUCTIONS_STDIO_EXTRAS),
     **_mcp_kwargs,
 )
 
@@ -277,17 +278,6 @@ def _validate_sort(sort_by: str, sort_order: str, platform: str) -> None:
         raise ValueError("OnlyFans does not support sorting by number_of_followers. Use relevancy, engagement_rate, or growth_rate.")
     if sort_by == "growth_rate" and platform not in ("instagram", "tiktok", "youtube"):
         raise ValueError(f"growth_rate sorting is only available on instagram, tiktok, youtube — not {platform}")
-
-
-def _parse_filters(filters_input: dict | str | None) -> dict[str, Any]:
-    if not filters_input:
-        return {}
-    if isinstance(filters_input, dict):
-        return filters_input
-    try:
-        return json.loads(filters_input)
-    except (json.JSONDecodeError, TypeError):
-        raise ValueError("filters must be a valid JSON object or JSON string")
 
 
 # The follower-count filter uses a different key per platform; sending the wrong
@@ -522,17 +512,19 @@ async def discover_creators(
     limit: Annotated[int, Field(description="Results per page (1-50)", ge=1, le=50)] = 20,
     sort_by: Annotated[str, Field(description="Sort field: relevancy, engagement_rate, number_of_followers, growth_rate. Can be combined with ai_search. growth_rate only on instagram/tiktok/youtube. number_of_followers not on onlyfans. relevancy only supports desc")] = "relevancy",
     sort_order: Annotated[str, Field(description="Sort direction: asc or desc (relevancy only supports desc)")] = "desc",
-    ai_search: Annotated[Optional[str], Field(description="AI-powered semantic search (3-150 chars). Can be combined with any sort_by. Keep queries SHORT (e.g., 'fitness', 'Claude AI'). Do NOT add extra words.")] = None,
-    filters: Annotated[Optional[dict], Field(description="Optional filters object. Common: type (string - creator type filter), location (array), gender (string), number_of_followers ({min,max}), engagement_percent ({min,max}), keywords_in_bio (array of strings), is_verified (bool), keywords_in_captions (array), hashtags (array), brands (array), creator_has (object of booleans)")] = None,
+    ai_search: Annotated[Optional[str], Field(description="AI-powered semantic search for niche/topic queries (3-150 chars). Short queries work best (e.g., 'fitness', 'retro gaming'). For topical searches keep sort_by=relevancy and constrain size with the number_of_followers filter — sorting by followers ranks the biggest matches, not the most relevant.")] = None,
+    filters: Annotated[Optional[DiscoveryFilters], Field(description="Structured filters — every legal filter is a property of this object. Some fields apply only to certain platforms.")] = None,
 ) -> str:
     """Search the Influencers.club database to discover creators/influencers. Returns profiles with basic stats.
     Costs 0.01 credits per creator returned.
-    IMPORTANT: Always present results in the exact order returned by the API — do NOT re-sort or reorder them."""
+    Results are returned in the API's ranking order, which is meaningful (relevance/sort position)."""
     try:
         platform = _validate_platform(platform, DISCOVERY_PLATFORMS)
         _validate_sort(sort_by, sort_order, platform)
-        f = _parse_filters(filters)
+        f = coerce_filters(filters)
         f = _map_follower_filter(f, platform)
+        # ai_search may arrive top-level (preferred) or inside filters; top-level wins.
+        ai_search = ai_search or f.pop("ai_search", None)
         if ai_search:
             ai_search = _validate_ai_search(ai_search)
             f["ai_search"] = ai_search
@@ -562,7 +554,7 @@ async def discover_creators_to_file(
     sort_by: Annotated[str, Field(description="Sort field: relevancy, engagement_rate, number_of_followers, growth_rate. Can be combined with ai_search")] = "relevancy",
     sort_order: Annotated[str, Field(description="Sort direction: asc or desc (relevancy only supports desc)")] = "desc",
     ai_search: Annotated[Optional[str], Field(description="AI-powered semantic search (3-150 chars). Can be combined with any sort_by.")] = None,
-    filters: Annotated[Optional[dict], Field(description="Optional filters object (same as discover_creators)")] = None,
+    filters: Annotated[Optional[DiscoveryFilters], Field(description="Structured filters (same schema as discover_creators)")] = None,
     filename: Annotated[Optional[str], Field(description="Optional custom filename (without extension). Defaults to auto-generated.")] = None,
 ) -> str:
     """Search creators and save results directly to a CSV file on disk. Fetches multiple pages automatically
@@ -573,9 +565,10 @@ async def discover_creators_to_file(
         platform = _validate_platform(platform, DISCOVERY_PLATFORMS)
         _validate_sort(sort_by, sort_order, platform)
         total_pages = min(pages, MAX_EXPORT_PAGES)
-        f = _parse_filters(filters)
+        f = coerce_filters(filters)
         f = _map_follower_filter(f, platform)
 
+        ai_search = ai_search or f.pop("ai_search", None)
         if ai_search:
             ai_search = _validate_ai_search(ai_search)
             f["ai_search"] = ai_search
@@ -657,13 +650,13 @@ async def find_similar_creators(
     platform: Annotated[str, Field(description="Platform of the reference creator (instagram, youtube, tiktok, twitch, onlyfans). ALWAYS ask the user — do not assume.")],
     filter_key: Annotated[str, Field(description='How to identify the creator: "url", "username", or "id"')] = "username",
     filter_value: Annotated[str, Field(description="The creator's URL, username, or platform ID")] = "",
-    filters: Annotated[Optional[dict], Field(description="Optional filters object (same filters as discover_creators)")] = None,
+    filters: Annotated[Optional[DiscoveryFilters], Field(description="Structured filters (same schema as discover_creators)")] = None,
     page: Annotated[int, Field(description="Page number (0-indexed, first page = 0)", ge=0)] = 0,
     limit: Annotated[int, Field(description="Results per page (1-50)", ge=1, le=50)] = 20,
 ) -> str:
     """Find creators similar to a specified creator. Always sorted by relevancy (no custom sort).
     Costs 0.01 credits per creator returned.
-    IMPORTANT: Present results in a table (handle, followers, engagement rate, etc.) in the exact order returned by the API — do NOT re-sort or reorder. Do NOT offer CSV export — no export tool exists for similar creators."""
+    Results are returned in relevance order, which is meaningful. No CSV export exists for similar creators."""
     try:
         if not filter_value or not filter_value.strip():
             raise ValueError("filter_value is required")
@@ -671,7 +664,7 @@ async def find_similar_creators(
         if filter_key not in ("url", "username", "id"):
             raise ValueError("filter_key must be 'url', 'username', or 'id'")
         filter_value = _validate_handle(filter_value)
-        f = _parse_filters(filters)
+        f = coerce_filters(filters)
         f = _map_follower_filter(f, platform)
 
         body: dict[str, Any] = {
