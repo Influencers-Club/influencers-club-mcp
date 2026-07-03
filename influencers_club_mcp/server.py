@@ -292,29 +292,10 @@ _FOLLOWER_FILTER_KEY = {
     "onlyfans": None,  # OnlyFans has no follower-count filter
 }
 
-# Common range sub-key aliases → the API's canonical {min, max}.
-_RANGE_ALIAS = {
-    "min": "min", "gte": "min", "gt": "min", "minimum": "min",
-    "max": "max", "lte": "max", "lt": "max", "maximum": "max",
-}
-
-
-def _normalize_range(value: Any, field: str) -> Any:
-    """Coerce a range filter to the API's {min,max}; map common aliases, reject the rest."""
-    if not isinstance(value, dict):
-        return value
-    out: dict[str, Any] = {}
-    for k, v in value.items():
-        canon = _RANGE_ALIAS.get(k.lower() if isinstance(k, str) else k)
-        if canon is None:
-            raise ValueError(f"'{field}' range accepts only 'min'/'max' (got '{k}').")
-        out[canon] = v
-    return out
-
-
 def _map_follower_filter(filters: dict, platform: str) -> dict:
     """Remap the caller's `number_of_followers` filter to the correct per-platform key.
-    Without this the API silently ignores a wrong-platform follower filter."""
+    Without this the API silently ignores a wrong-platform follower filter. The value is
+    already a canonical {min,max} dict here (Range folds aliases at validation time)."""
     if "number_of_followers" not in filters:
         return filters
     target = _FOLLOWER_FILTER_KEY.get(platform)
@@ -323,9 +304,7 @@ def _map_follower_filter(filters: dict, platform: str) -> dict:
             f"{platform} has no follower-count filter — remove 'number_of_followers'."
         )
     filters = dict(filters)
-    filters[target] = _normalize_range(
-        filters.pop("number_of_followers"), "number_of_followers"
-    )
+    filters[target] = filters.pop("number_of_followers")
     return filters
 
 
