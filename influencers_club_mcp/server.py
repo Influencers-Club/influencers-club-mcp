@@ -626,7 +626,7 @@ async def discover_creators_to_file(
     annotations={"title": "Find Similar Creators", "readOnlyHint": True, "destructiveHint": False, "openWorldHint": True},
 )
 async def find_similar_creators(
-    platform: Annotated[str, Field(description="Platform of the reference creator (instagram, youtube, tiktok, twitch, onlyfans). ALWAYS ask the user — do not assume.")],
+    platform: Annotated[str, Field(description="Platform of the reference creator (instagram, youtube, tiktok, twitch, onlyfans). The same username can exist on several platforms, so this must match the platform the user means.")],
     filter_key: Annotated[str, Field(description='How to identify the creator: "url", "username", or "id"')] = "username",
     filter_value: Annotated[str, Field(description="The creator's URL, username, or platform ID")] = "",
     filters: Annotated[Optional[DiscoveryFilters], Field(description="Structured filters (same schema as discover_creators)")] = None,
@@ -685,21 +685,6 @@ async def audience_overlap(
             raise ValueError("Must provide 2-10 creator usernames")
 
         result = await client.post(f"{API_V1}/creators/audience/overlap/", {"platform": platform, "creators": creators})
-
-        # Suggest a fitting visualization based on creator count
-        if isinstance(result, dict):
-            num_creators = len(creators)
-            if num_creators <= 3:
-                result["_visualization_hint"] = (
-                    "This overlap data suits a Venn diagram: one circle per creator's audience, "
-                    "with follower counts on the circles and overlap counts in the intersections."
-                )
-            else:
-                result["_visualization_hint"] = (
-                    "This overlap data suits a heatmap: creators on both axes, each cell showing the "
-                    "pairwise overlap percentage, color-scaled from low to high."
-                )
-
         return json.dumps(result, indent=2)
     except Exception as e:
         return _error_response(e)
@@ -903,9 +888,10 @@ def _bulk_enrich_hint(items: str) -> str:
     name="enrich_by_handle",
     annotations={"title": "Enrich by Handle (Full)", "readOnlyHint": True, "destructiveHint": False, "openWorldHint": True},
     description=(
-        "Enrich ONE creator by handle. Costs 1 credit."
+        "Enrich ONE creator by handle (full data: email, demographics, audience, income, brand deals). "
+        "Costs 1 credit."
         + _bulk_enrich_hint("handles")
-        + " Use enrich_by_handle_raw (0.03 cr) for basic lookups unless the user asks for full data."
+        + " For basic profile data only, enrich_by_handle_raw returns a smaller result at 0.03 credits."
     ),
 )
 async def enrich_by_handle(
