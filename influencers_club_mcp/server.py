@@ -626,7 +626,7 @@ async def discover_creators_to_file(
     annotations={"title": "Find Similar Creators", "readOnlyHint": True, "destructiveHint": False, "openWorldHint": True},
 )
 async def find_similar_creators(
-    platform: Annotated[str, Field(description="Platform of the reference creator (instagram, youtube, tiktok, twitch, onlyfans). ALWAYS ask the user — do not assume.")],
+    platform: Annotated[str, Field(description="Platform of the reference creator (instagram, youtube, tiktok, twitch, onlyfans). The same username can exist on several platforms, so this must match the platform the user means.")],
     filter_key: Annotated[str, Field(description='How to identify the creator: "url", "username", or "id"')] = "username",
     filter_value: Annotated[str, Field(description="The creator's URL, username, or platform ID")] = "",
     filters: Annotated[Optional[DiscoveryFilters], Field(description="Structured filters (same schema as discover_creators)")] = None,
