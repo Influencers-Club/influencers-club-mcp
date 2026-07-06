@@ -4,12 +4,37 @@
 
 MCP server for the [Influencers Club API](https://influencers.club/influencer-api/) — creator enrichment, discovery, audience analysis, content data, batch operations, and account management.
 
-## Prerequisites
+Two ways to use it:
+
+| | Best for |
+|---|---|
+| [**Hosted connector on claude.ai**](#use-with-claudeai-hosted-connector) | No install — connect once with your Influencers Club account |
+| [**Local install (stdio)**](#local-install-stdio) | Claude Desktop / Claude Code / IDEs, plus local file tools (CSV export, batch upload) |
+
+## Use with claude.ai (Hosted Connector)
+
+The hosted server runs at `https://mcp-dashboard.influencers.club/mcp` and signs you in with OAuth — no API key to copy around.
+
+1. In Claude, open **Settings → Connectors → Add custom connector** (or find **Influencers Club** in the connectors directory).
+2. Enter the URL: `https://mcp-dashboard.influencers.club/mcp`
+3. Click **Connect** — you'll be redirected to the Influencers Club dashboard to sign in and approve access.
+4. Done. Ask Claude things like *"Find 5 Instagram creators in fitness with 50k-500k followers."*
+
+**Requirements:** an [Influencers Club](https://influencers.club) account with API credits. Discovery and enrichment tools consume credits (costs are listed on every tool and in the tables below); dictionary/lookup tools are free.
+
+**Notes:**
+- The hosted connector exposes the 19 API tools. File and batch tools (CSV export, bulk CSV enrichment) need a local filesystem and are available only in the [local install](#local-install-stdio).
+- **Connection expired / 401 errors:** disconnect and reconnect the connector to re-authenticate.
+- **"Insufficient credits" errors:** top up in the [dashboard](https://dashboard.influencers.club); calls keep failing until the balance is positive.
+
+## Local Install (stdio)
+
+### Prerequisites
 
 - Python 3.10+ or [Docker Desktop](https://www.docker.com/products/docker-desktop/)
 - An [Influencers Club API key](https://docs.influencers.club/#authentication)
 
-## Quick Start (pip)
+### Quick Start (pip)
 
 ```bash
 pip install influencers-club-mcp
@@ -51,8 +76,6 @@ Restart Claude Desktop — the server will appear as "influencers-club". That's 
 > "IMPORTS_DIR": "/your/custom/imports"
 > ```
 
-## Other Clients
-
 ### Claude Code
 
 Add to your project's `.mcp.json` or global `~/.claude/settings.json`:
@@ -87,7 +110,7 @@ Add to `.vscode/mcp.json` in your project:
 }
 ```
 
-## Docker (Advanced)
+### Docker (Advanced)
 
 Use Docker if you want filesystem isolation or prefer containerized deployments.
 
@@ -131,14 +154,16 @@ After configuring, restart your client. The server will appear as "influencers-c
 
 ## Available Tools (29)
 
+19 API tools are available everywhere (hosted connector and local). Tools marked **local only** need the local filesystem, so they exist only in stdio installs.
+
 ### Creator Discovery
 
 | Tool | Description | Cost |
 |---|---|---|
 | `discover_creators` | AI semantic search with filters (followers, engagement, location, etc.) | 0.01/creator |
-| `discover_creators_to_file` | Multi-page discovery with CSV export to disk | 0.01/creator |
+| `discover_creators_to_file` *(local only)* | Multi-page discovery with CSV export to disk | 0.01/creator |
 | `find_similar_creators` | Find creators similar to a seed creator | 0.01/creator |
-| `audience_overlap` | Compare audience overlap between 2-10 creators (auto-visualized) | 1 credit |
+| `audience_overlap` | Compare audience overlap between 2-10 creators | 1 credit |
 
 ### Enrichment
 
@@ -156,7 +181,7 @@ After configuring, restart your client. The server will appear as "influencers-c
 | `get_creator_posts` | Fetch recent posts with engagement metrics (IG, TikTok, YouTube) | 0.15 credits |
 | `get_post_details` | Deep content analysis (comments, transcript, audio) | 0.03 credits |
 
-### Batch Enrichment
+### Batch Enrichment *(local only)*
 
 | Tool | Description | Cost |
 |---|---|---|
@@ -165,7 +190,7 @@ After configuring, restart your client. The server will appear as "influencers-c
 | `download_batch_results` | Download completed batch results as CSV | free |
 | `resume_batch` | Resume a paused batch after adding credits | free |
 
-### File Management
+### File Management *(local only)*
 
 | Tool | Description | Cost |
 |---|---|---|
@@ -203,14 +228,11 @@ After configuring, restart your client. The server will appear as "influencers-c
 **Enrich a creator profile by handle:**
 > "Get me the full profile for @cristiano on Instagram, including audience demographics."
 
-**Batch enrich a CSV of emails:**
-> "I have a CSV of 3,000 emails to batch enrich." — Claude will open the upload page for you.
-
 **Find similar creators for campaign scaling:**
 > "I like the creator @MrBeast on YouTube. Find 10 similar creators with at least 100k followers."
 
 **Compare audience overlap:**
-> "Compare the audience overlap between @nike, @adidas, and @puma on Instagram." — Claude will generate a Venn diagram.
+> "Compare the audience overlap between @nike, @adidas, and @puma on Instagram."
 
 **Get a creator's recent posts:**
 > "Show me the latest posts from @garyvee on TikTok with engagement metrics."
@@ -221,18 +243,6 @@ After configuring, restart your client. The server will appear as "influencers-c
 **Check your remaining API credits:**
 > "How many credits do I have left?"
 
-## Batch Enrichment Modes
-
-| Mode | Input | Cost | Requires Platform |
-|------|-------|------|-------------------|
-| `basic` | emails | 0.05/record | No |
-| `raw` | handles | 0.03/record | Yes |
-| `full` | handles | 1/record | Yes |
-
-For large files (100+ entries), Claude opens a browser upload page at `http://localhost:8090`. Drag-and-drop your CSV — Claude auto-detects the upload and starts processing. For smaller batches (under 100), Claude enriches them in parallel automatically.
-
-The upload page accepts multi-column CSVs and automatically extracts the correct column.
-
 ## Supported Platforms
 
 | Capability | Platforms |
@@ -242,7 +252,7 @@ The upload page accepts multi-column CSVs and automatically extracts the correct
 | Content Data | Instagram, TikTok, YouTube |
 | Audience Overlap | Instagram, TikTok, YouTube |
 
-## Environment Variables
+## Environment Variables (local install)
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
@@ -254,6 +264,14 @@ The upload page accepts multi-column CSVs and automatically extracts the correct
 | `IMPORT_HOST_DIR` | No | — | Host path for uploaded files |
 | `MAX_CALLS_PER_MINUTE` | No | 300 | Client-side rate limit |
 
+## Troubleshooting
+
+- **Hosted connector shows "disconnected" or tools return 401** — remove and re-add the connector (or click Reconnect) to refresh the OAuth session.
+- **Errors mentioning credits or limits** — check your balance with `check_credits` or in the [dashboard](https://dashboard.influencers.club); calls fail until the limit resets or credits are added.
+- **Local: server doesn't appear in Claude Desktop** — verify the config JSON is valid and restart the app; check that `influencers-club-mcp` runs from a terminal.
+- **Local: upload page unreachable** — another process may hold port 8090; set `UPLOAD_PORT` to a free port.
+- Anything else: [open an issue](https://github.com/Influencers-Club/influencers-club-mcp/issues) or email **gjorgji.p@influencers.club**.
+
 ## Privacy Policy
 
 This MCP server is a thin client between Claude and the [Influencers Club API](https://docs.influencers.club/). The sections below describe what the server itself does with your data; the Influencers Club platform's full data practices are governed by the [Influencers Club Privacy Policy](https://influencers.club/privacy-policy).
@@ -264,7 +282,7 @@ This MCP server is a thin client between Claude and the [Influencers Club API](h
 
 **Storage.** The server keeps no database. The only data written to disk are: (a) CSV exports/imports the user explicitly creates via the file tools, written to local directories the user controls (`exports/`, `imports/`, or paths set by `EXPORT_HOST_DIR` / `IMPORT_HOST_DIR`); (b) a small `.ic_config.json` file storing the chosen export path. No conversation content, API responses, or credentials are persisted.
 
-**Third-party sharing.** The server communicates with exactly one third party: `api-dashboard.influencers.club`. No data is sent to any other endpoint, analytics service, or telemetry provider. The bearer token is transmitted only to the Influencers Club API over HTTPS and is redacted from any error messages returned to Claude.
+**Third-party sharing.** The server communicates with exactly one third party: the Influencers Club API. No data is sent to any other endpoint, analytics service, or telemetry provider. The bearer token is transmitted only to the Influencers Club API over HTTPS and is redacted from any error messages returned to Claude.
 
 **Retention.** The server retains nothing in-process beyond the lifetime of a single tool call, with the exception of the user-controlled CSV files described above, which the user can delete at any time. Bearer tokens are read from environment variables (or, in hosted/HTTP mode, from the authenticated request) and are never written to disk.
 
