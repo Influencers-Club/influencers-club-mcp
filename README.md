@@ -13,10 +13,10 @@ Two ways to use it:
 
 ## Use with claude.ai (Hosted Connector)
 
-The hosted server runs at `https://mcp.influencers.club/mcp` and signs you in with OAuth — no API key to copy around.
+The hosted server runs at `https://mcp-dashboard.influencers.club/mcp` and signs you in with OAuth — no API key to copy around.
 
 1. In Claude, open **Settings → Connectors → Add custom connector** (or find **Influencers Club** in the connectors directory).
-2. Enter the URL: `https://mcp.influencers.club/mcp`
+2. Enter the URL: `https://mcp-dashboard.influencers.club/mcp`
 3. Click **Connect** — you'll be redirected to the Influencers Club dashboard to sign in and approve access.
 4. Done. Ask Claude things like *"Find 5 Instagram creators in fitness with 50k-500k followers."*
 
