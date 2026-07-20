@@ -1,7 +1,5 @@
 name: deploy-to-beanstalk-prod
 
-# Prod deploys are manual and deliberate — trigger from the Actions tab.
-# Secrets come from the "Prod" GitHub Environment (separate AWS account from Stage).
 on:
   workflow_dispatch:
 
@@ -31,6 +29,9 @@ jobs:
     runs-on: ubuntu-latest
     environment: Prod
     needs: [build]
+    permissions:
+      id-token: write
+      contents: read
     steps:
       - name: Checkout source code
         uses: actions/checkout@v6
@@ -40,17 +41,24 @@ jobs:
           sed -i -E 's/^version = .*/version = "1.0.${{ github.run_number }}"/' pyproject.toml
           grep -E '^version' pyproject.toml
 
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::489260375501:role/deploy-mcp-prod
+          aws-region:     ${{ secrets.AWS_REGION }}
+
       - name: Generate deployment package
         run: zip -r deploy_package_${{ github.sha }}.zip . -x '*.git*'
 
       - name: Deploy Elastic Beanstalk Application
         uses: einaregilsson/beanstalk-deploy@v22
         with:
-          aws_access_key:       ${{ secrets.ACCESS_KEY_ID }}
-          aws_secret_key:       ${{ secrets.SECRET_ACCESS_KEY }}
+          aws_access_key:       ${{ env.AWS_ACCESS_KEY_ID }}
+          aws_secret_key:       ${{ env.AWS_SECRET_ACCESS_KEY }}
+          aws_session_token:    ${{ env.AWS_SESSION_TOKEN }}
           application_name:     ${{ secrets.ELASTIC_APP_NAME }}
           environment_name:     ${{ secrets.ELASTIC_APP_NAME }}
-          version_label:        ver-${{ github.sha }}
+          version_label:        ver-${{ github.sha }}-${{ github.run_number }}-${{ github.run_attempt }}
           existing_bucket_name: ${{ secrets.S3_BUNDLE_NAME }}
           region:               ${{ secrets.AWS_REGION }}
           deployment_package:   deploy_package_${{ github.sha }}.zip
