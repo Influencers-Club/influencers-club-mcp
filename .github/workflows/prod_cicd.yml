@@ -44,7 +44,7 @@ jobs:
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: arn:aws:iam::489260375501:role/deploy-mcp-prod
+          role-to-assume: ${{ secrets.DEPLOY_ROLE_ARN }}
           aws-region:     ${{ secrets.AWS_REGION }}
 
       - name: Generate deployment package
