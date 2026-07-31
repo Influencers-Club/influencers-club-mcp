@@ -19,7 +19,7 @@ from mcp.server.fastmcp.server import TransportSecuritySettings
 from mcp.server.lowlevel.server import request_ctx
 from pydantic import Field
 
-from .api_client import ApiError, InfluencersApiClient
+from .api_client import ApiError, InfluencersApiClient, _log, _sanitize
 from .csv_export import creators_to_csv
 from .discovery_filters import DiscoveryFilters, coerce_filters
 
@@ -219,6 +219,19 @@ if HTTP_MODE:
         ct = request.headers.get("content-type", "application/x-www-form-urlencoded")
         async with httpx.AsyncClient(timeout=30.0) as http:
             r = await http.post(f"{_DASH}{path}", content=body, headers={"Content-Type": ct})
+        if 400 <= r.status_code < 500:
+            # Claude's own grants come through here, and a rejection is returned to it
+            # verbatim with no record of why — the dashboard signals invalid_grant vs
+            # invalid_scope vs invalid_request only in the body, all as 400. Log the
+            # grant type and that body so a failed refresh is diagnosable.
+            # 4xx only: a 5xx on a DEBUG=True env renders a traceback whose locals hold
+            # credentials. The REQUEST body is never logged — it carries the refresh
+            # token, the auth code and the PKCE verifier.
+            grant = re.search(rb"grant_type=([A-Za-z0-9_.:%-]+)", body)
+            _log(
+                f"oauth-proxy {path} grant={grant.group(1).decode() if grant else '?'} "
+                f"-> {r.status_code}: {_sanitize(r.text[:300])}"
+            )
         return Response(
             content=r.content,
             status_code=r.status_code,
