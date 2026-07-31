@@ -20,10 +20,11 @@ classifiers = [
     "Programming Language :: Python :: 3.13",
 ]
 dependencies = [
-    # Capped below 2.0: the 2.x SDK drops mcp.server.fastmcp, which server.py
-    # imports. requirements.txt (what deploys install) already pins 1.27.1 — this
-    # keeps the unpinned CI install on the same major.
-    "mcp[cli]>=1.0.0,<2",
+    # Floor is 1.28.1: everything below it carries HIGH advisories (unverified
+    # principal on HTTP session requests, cross-client task access, missing
+    # WebSocket Host/Origin validation). Capped below 2.0 because the 2.x SDK
+    # drops mcp.server.fastmcp, which server.py imports.
+    "mcp[cli]>=1.28.1,<2",
     "httpx>=0.27.0",
     "pydantic>=2.0.0",
 ]
