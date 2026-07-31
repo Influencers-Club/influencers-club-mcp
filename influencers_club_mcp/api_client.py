@@ -154,6 +154,18 @@ class InfluencersApiClient:
                 },
                 timeout=DEFAULT_TIMEOUT,
             )
+            if 400 <= resp.status_code < 500:
+                # The dashboard returns an OAuth error code in the body
+                # (invalid_grant vs invalid_scope vs invalid_request), all as 400.
+                # raise_for_status() drops it, leaving the failures
+                # indistinguishable in the logs — surface it before raising.
+                # 4xx only: these bodies are fixed OAuth error strings, whereas a
+                # 5xx on a DEBUG=True env renders a traceback whose locals hold the
+                # subject token and client secret.
+                _log(
+                    f"token-exchange {resp.status_code}: "
+                    f"{_sanitize(resp.text[:300])}"
+                )
             resp.raise_for_status()
             payload = resp.json()
         except Exception as e:
