@@ -128,6 +128,27 @@ class InfluencersApiClient:
             "or authenticate via OAuth (HTTP).",
         )
 
+    async def ensure_exchangeable(self, user_token: str) -> bool:
+        """Whether this subject token can still be exchanged for a dashboard token.
+
+        Called from the auth layer before a tool runs, so that a token the
+        dashboard has already deactivated is refused with a 401 the client renews
+        from — instead of being admitted and then failing inside the tool, where
+        the user sees it.
+
+        Returns False ONLY when the dashboard definitively rejects the token
+        (_exchange_token raises 401 on invalid_grant). Any other failure — network,
+        timeout, 5xx, misconfiguration — returns True, so a wobble upstream can
+        never turn into a mass logout here.
+        """
+        try:
+            await self._exchange_token(user_token)
+            return True
+        except ApiError as e:
+            return e.status != 401
+        except Exception:
+            return True
+
     async def _exchange_token(self, user_token: str) -> str:
         """Exchange the user's MCP-audience token for a dashboard-audience token
         (RFC 8693 token exchange), authenticating as the MCP confidential client.
