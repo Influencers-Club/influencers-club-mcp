@@ -41,6 +41,30 @@ def _log(msg: str) -> None:
     print(f"[MCP auth] {msg}", file=sys.stderr)
 
 
+# The verifier built by build_auth(), exposed so the API client can drop a token
+# whose exchange the dashboard rejected. Without this the admission cache keeps
+# vouching for a token the dashboard has already deactivated (see
+# invalidate_cached_token).
+_ACTIVE_VERIFIER: ICTokenVerifier | None = None
+
+
+def invalidate_cached_token(token: str) -> bool:
+    """Evict a token from the introspection admission cache.
+
+    verify_token caches a successful introspection for cache_ttl seconds. When the
+    user refreshes, the dashboard deactivates the previous access token instantly,
+    but this cache keeps admitting it until the entry ages out — and the upstream
+    token-exchange, which reads the database rather than the cache, then rejects it
+    with invalid_grant. Dropping the entry here makes the next request re-introspect,
+    get the authoritative answer, and return a 401 the client can recover from.
+
+    Returns True if an entry was removed (i.e. this token really was cached).
+    """
+    if _ACTIVE_VERIFIER is None:
+        return False
+    return _ACTIVE_VERIFIER._cache.pop(token, None) is not None
+
+
 class ICTokenVerifier(TokenVerifier):
     """Validate dashboard-issued OAuth tokens via RFC 7662 introspection.
 
@@ -175,6 +199,8 @@ def build_auth() -> tuple[ICTokenVerifier | None, AuthSettings | None]:
         cfg.scopes,
         cache_ttl=cfg.cache_ttl,
     )
+    global _ACTIVE_VERIFIER
+    _ACTIVE_VERIFIER = verifier
     settings = AuthSettings(
         issuer_url=cfg.issuer,
         resource_server_url=cfg.resource,
