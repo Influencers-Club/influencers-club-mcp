@@ -165,6 +165,16 @@ if HTTP_MODE:
     async def healthcheck(_request: Request) -> JSONResponse:
         return JSONResponse({"status": "ok"})
 
+    # OpenAI Apps directory domain verification (GRO-646). The submission portal
+    # issues a challenge token that must be served as a bare string — no JSON —
+    # at this exact path on the MCP host. Unset env var → 404, route is inert.
+    @mcp.custom_route("/.well-known/openai-apps-challenge", methods=["GET"])
+    async def openai_apps_challenge(_request: Request) -> "Response":
+        token = os.environ.get("OPENAI_APPS_CHALLENGE_TOKEN", "").strip()
+        if not token:
+            return Response(status_code=404)
+        return Response(content=token, media_type="text/plain")
+
     # OAuth glue for the Claude.ai connector. Claude looks for the AS metadata AND
     # the authorize/token/register endpoints ON THE MCP HOST (same-origin as the
     # resource); FastMCP serves none of these, so the flow 404s before consent. We
@@ -196,7 +206,7 @@ if HTTP_MODE:
                 "response_types_supported": ["code"],
                 "grant_types_supported": ["authorization_code", "refresh_token"],
                 "code_challenge_methods_supported": ["S256"],
-                "token_endpoint_auth_methods_supported": ["none"],
+                "token_endpoint_auth_methods_supported": ["none", "client_secret_post"],
                 "scopes_supported": _oauth.scopes or ["all"],
             },
             headers={
