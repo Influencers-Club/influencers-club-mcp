@@ -8,7 +8,7 @@ Two ways to use it:
 
 | | Best for |
 |---|---|
-| [**Hosted connector on claude.ai**](#use-with-claudeai-hosted-connector) | No install — connect once with your Influencers Club account |
+| [**Hosted connector (claude.ai, ChatGPT)**](#use-with-claudeai-hosted-connector) | No install — connect once with your Influencers Club account |
 | [**Local install (stdio)**](#local-install-stdio) | Claude Desktop / Claude Code / IDEs, plus local file tools (CSV export, batch upload) |
 
 ## Use with claude.ai (Hosted Connector)
@@ -26,6 +26,15 @@ The hosted server runs at `https://mcp-dashboard.influencers.club/mcp` and signs
 - The hosted connector exposes the 19 API tools. File and batch tools (CSV export, bulk CSV enrichment) need a local filesystem and are available only in the [local install](#local-install-stdio).
 - **Connection expired / 401 errors:** disconnect and reconnect the connector to re-authenticate.
 - **"Insufficient credits" errors:** top up in the [dashboard](https://dashboard.influencers.club); calls keep failing until the balance is positive.
+
+## Use with ChatGPT (Developer Mode)
+
+The same hosted server works as a ChatGPT connector:
+
+1. In ChatGPT, enable **Settings → Apps → Advanced settings → Developer mode** (available on Plus, Pro, Business, Enterprise, and Edu plans).
+2. Add a new connector with the URL: `https://mcp-dashboard.influencers.club/mcp`
+3. Click **Connect** — you'll be redirected to the Influencers Club dashboard to sign in and approve access.
+4. Done. The same 19 API tools are available; the credit requirements and notes from the claude.ai section apply unchanged.
 
 ## Local Install (stdio)
 
@@ -274,15 +283,15 @@ After configuring, restart your client. The server will appear as "influencers-c
 
 ## Privacy Policy
 
-This MCP server is a thin client between Claude and the [Influencers Club API](https://docs.influencers.club/). The sections below describe what the server itself does with your data; the Influencers Club platform's full data practices are governed by the [Influencers Club Privacy Policy](https://influencers.club/privacy-policy).
+This MCP server is a thin client between the connected AI assistant (e.g. Claude or ChatGPT) and the [Influencers Club API](https://docs.influencers.club/). The sections below describe what the server itself does with your data; the Influencers Club platform's full data practices are governed by the [Influencers Club Privacy Policy](https://influencers.club/privacy-policy).
 
-**Data we collect.** None. The server does not collect, persist, or transmit personally identifiable information about the human using Claude. The only inputs it receives are the tool arguments Claude sends (e.g. a creator handle or a CSV path) and the bearer token used to authenticate against the Influencers Club API.
+**Data we collect.** None. The server does not collect, persist, or transmit personally identifiable information about the human using the AI assistant. The only inputs it receives are the tool arguments the assistant sends (e.g. a creator handle or a CSV path) and the bearer token used to authenticate against the Influencers Club API.
 
-**How data is used.** Tool arguments are forwarded directly to the Influencers Club API to fulfill the requested operation (discovery, enrichment, batch processing, etc.). Responses are returned to Claude. The server performs no analytics, profiling, or model training on this data.
+**How data is used.** Tool arguments are forwarded directly to the Influencers Club API to fulfill the requested operation (discovery, enrichment, batch processing, etc.). Responses are returned to the assistant. The server performs no analytics, profiling, or model training on this data.
 
 **Storage.** The server keeps no database. The only data written to disk are: (a) CSV exports/imports the user explicitly creates via the file tools, written to local directories the user controls (`exports/`, `imports/`, or paths set by `EXPORT_HOST_DIR` / `IMPORT_HOST_DIR`); (b) a small `.ic_config.json` file storing the chosen export path. No conversation content, API responses, or credentials are persisted.
 
-**Third-party sharing.** The server communicates with exactly one third party: the Influencers Club API. No data is sent to any other endpoint, analytics service, or telemetry provider. The bearer token is transmitted only to the Influencers Club API over HTTPS and is redacted from any error messages returned to Claude.
+**Third-party sharing.** The server communicates with exactly one third party: the Influencers Club API. No data is sent to any other endpoint, analytics service, or telemetry provider. The bearer token is transmitted only to the Influencers Club API over HTTPS and is redacted from any error messages returned to the assistant.
 
 **Retention.** The server retains nothing in-process beyond the lifetime of a single tool call, with the exception of the user-controlled CSV files described above, which the user can delete at any time. Bearer tokens are read from environment variables (or, in hosted/HTTP mode, from the authenticated request) and are never written to disk.
 
