@@ -48,7 +48,7 @@ jobs:
         env:
           INFLUENCERS_CLUB_API_KEY: dummy_for_ci
           MCP_TRANSPORT: http
-          ALLOWED_ORIGINS: https://claude.ai,https://claude.com
+          ALLOWED_ORIGINS: https://claude.ai,https://claude.com,https://chatgpt.com,https://openai.com
           ALLOWED_HOSTS: mcp.influencers.club
         run: |
           python - <<'PY'
