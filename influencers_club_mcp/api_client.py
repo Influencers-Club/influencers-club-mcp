@@ -13,6 +13,7 @@ from typing import Any
 
 import httpx
 
+from .auth import invalidate_cached_token
 from .oauth_config import load_oauth_config
 
 try:
@@ -127,6 +128,27 @@ class InfluencersApiClient:
             "or authenticate via OAuth (HTTP).",
         )
 
+    async def ensure_exchangeable(self, user_token: str) -> bool:
+        """Whether this subject token can still be exchanged for a dashboard token.
+
+        Called from the auth layer before a tool runs, so that a token the
+        dashboard has already deactivated is refused with a 401 the client renews
+        from — instead of being admitted and then failing inside the tool, where
+        the user sees it.
+
+        Returns False ONLY when the dashboard definitively rejects the token
+        (_exchange_token raises 401 on invalid_grant). Any other failure — network,
+        timeout, 5xx, misconfiguration — returns True, so a wobble upstream can
+        never turn into a mass logout here.
+        """
+        try:
+            await self._exchange_token(user_token)
+            return True
+        except ApiError as e:
+            return e.status != 401
+        except Exception:
+            return True
+
     async def _exchange_token(self, user_token: str) -> str:
         """Exchange the user's MCP-audience token for a dashboard-audience token
         (RFC 8693 token exchange), authenticating as the MCP confidential client.
@@ -166,6 +188,25 @@ class InfluencersApiClient:
                     f"token-exchange {resp.status_code}: "
                     f"{_sanitize(resp.text[:300])}"
                 )
+                if "invalid_grant" in resp.text:
+                    # The dashboard will not exchange this subject token, which means
+                    # it is no longer active there — almost always because the user
+                    # refreshed and the previous access token was deactivated, while
+                    # our admission cache still vouches for it. Drop the cache entry
+                    # so the next request re-introspects and gets the authoritative
+                    # answer, and report 401 rather than the upstream 400: 400 reads
+                    # as a permanent tool failure and strands the session until the
+                    # user re-authorizes by hand, whereas 401 is the signal to renew.
+                    self._exchange_cache.pop(user_token, None)
+                    evicted = invalidate_cached_token(user_token)
+                    _log(
+                        "token-exchange rejected the subject token; cleared "
+                        f"admission cache (hit={evicted}) and signalling re-auth"
+                    )
+                    raise ApiError(
+                        401,
+                        "Access token is no longer valid upstream; re-authenticate.",
+                    )
             resp.raise_for_status()
             payload = resp.json()
         except Exception as e:

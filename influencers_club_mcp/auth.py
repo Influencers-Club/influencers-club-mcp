@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import sys
 import time
+from typing import Awaitable, Callable
 
 import httpx
 from mcp.server.auth.provider import AccessToken, TokenVerifier
@@ -39,6 +40,30 @@ _INTROSPECT_PATH = "/public/v1/oauth/introspect/"
 
 def _log(msg: str) -> None:
     print(f"[MCP auth] {msg}", file=sys.stderr)
+
+
+# The verifier built by build_auth(), exposed so the API client can drop a token
+# whose exchange the dashboard rejected. Without this the admission cache keeps
+# vouching for a token the dashboard has already deactivated (see
+# invalidate_cached_token).
+_ACTIVE_VERIFIER: ICTokenVerifier | None = None
+
+
+def invalidate_cached_token(token: str) -> bool:
+    """Evict a token from the introspection admission cache.
+
+    verify_token caches a successful introspection for cache_ttl seconds. When the
+    user refreshes, the dashboard deactivates the previous access token instantly,
+    but this cache keeps admitting it until the entry ages out — and the upstream
+    token-exchange, which reads the database rather than the cache, then rejects it
+    with invalid_grant. Dropping the entry here makes the next request re-introspect,
+    get the authoritative answer, and return a 401 the client can recover from.
+
+    Returns True if an entry was removed (i.e. this token really was cached).
+    """
+    if _ACTIVE_VERIFIER is None:
+        return False
+    return _ACTIVE_VERIFIER._cache.pop(token, None) is not None
 
 
 class ICTokenVerifier(TokenVerifier):
@@ -65,12 +90,48 @@ class ICTokenVerifier(TokenVerifier):
         self._scopes = scopes
         self._cache_ttl = cache_ttl
         self._cache: dict[str, tuple[float, AccessToken]] = {}
+        self._exchange_probe: Callable[[str], Awaitable[bool]] | None = None
+
+    def set_exchange_probe(self, probe: Callable[[str], Awaitable[bool]]) -> None:
+        """Register the check that decides whether a token is still exchangeable.
+
+        Introspection alone is not enough. Every tool call ultimately needs to
+        exchange this token for a dashboard token, and the exchange reads the
+        database while our admission cache does not — so the two can disagree for
+        up to cache_ttl seconds after the user refreshes. When they disagree the
+        request is admitted here and then dies inside the tool, where the failure
+        is user-visible. Probing here moves that verdict in front of the tool, so
+        a dead token produces a 401 the client renews from silently.
+        """
+        self._exchange_probe = probe
+
+    async def _exchangeable(self, token: str) -> bool:
+        """True unless the probe positively says this token cannot be exchanged.
+
+        The probe is cached by the API client, so in steady state this costs
+        nothing. It deliberately fails OPEN on transient errors — its job is to
+        catch definitively dead tokens early, not to become a new way for a blip
+        in the dashboard to log everyone out.
+        """
+        if self._exchange_probe is None:
+            return True
+        try:
+            return await self._exchange_probe(token)
+        except Exception as exc:  # never let the probe itself reject a request
+            _log(f"exchange probe errored ({type(exc).__name__}); allowing")
+            return True
 
     async def verify_token(self, token: str) -> AccessToken | None:
         now = time.monotonic()
         hit = self._cache.get(token)
         if hit and hit[0] > now:
-            return hit[1]
+            # Cached admission is exactly where the stale-token bug lives: the
+            # dashboard may have deactivated this token since we cached it.
+            if await self._exchangeable(token):
+                return hit[1]
+            _log("cached token is no longer exchangeable; forcing re-auth")
+            self._cache.pop(token, None)
+            return None
 
         try:
             async with httpx.AsyncClient(timeout=10.0) as http:
@@ -128,6 +189,12 @@ class ICTokenVerifier(TokenVerifier):
             expires_at=int(exp) if exp else None,
             resource=self._resource,
         )
+        # Introspection says the token is live; confirm it is actually exchangeable
+        # before admitting it, so the tool never discovers the problem instead.
+        if not await self._exchangeable(token):
+            _log("token introspects active but is not exchangeable; rejecting")
+            return None
+
         # Trust the introspection result for a short window; never past the token's
         # own expiry.
         ttl = self._cache_ttl
@@ -175,6 +242,8 @@ def build_auth() -> tuple[ICTokenVerifier | None, AuthSettings | None]:
         cfg.scopes,
         cache_ttl=cfg.cache_ttl,
     )
+    global _ACTIVE_VERIFIER
+    _ACTIVE_VERIFIER = verifier
     settings = AuthSettings(
         issuer_url=cfg.issuer,
         resource_server_url=cfg.resource,

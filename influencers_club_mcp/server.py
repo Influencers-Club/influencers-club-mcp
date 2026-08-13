@@ -105,6 +105,8 @@ _transport_security = (
 )
 
 _mcp_kwargs: dict[str, Any] = {}
+# Only built in HTTP mode; stdio has no bearer tokens to verify.
+_token_verifier = None
 if HTTP_MODE:
     _mcp_kwargs["transport_security"] = _transport_security
     _mcp_kwargs["host"] = os.environ.get("MCP_HOST", "0.0.0.0")
@@ -257,6 +259,12 @@ if HTTP_MODE:
         return await _proxy_post(request, "/public/v1/oauth/register/")
 
 client = InfluencersApiClient()
+
+# Let the token verifier ask the API client whether a token is still exchangeable.
+# Wired here because the verifier is built before the client exists, and doing it
+# this way keeps auth.py free of any import back into api_client.
+if _token_verifier is not None:
+    _token_verifier.set_exchange_probe(client.ensure_exchangeable)
 
 
 def stdio_only_tool(*tool_args, **tool_kwargs):
