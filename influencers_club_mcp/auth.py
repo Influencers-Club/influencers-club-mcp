@@ -24,7 +24,7 @@ are unaffected.
 
 from __future__ import annotations
 
-import sys
+import logging
 import time
 from typing import Awaitable, Callable
 
@@ -38,8 +38,7 @@ from .oauth_config import load_oauth_config
 _INTROSPECT_PATH = "/public/v1/oauth/introspect/"
 
 
-def _log(msg: str) -> None:
-    print(f"[MCP auth] {msg}", file=sys.stderr)
+logger = logging.getLogger(__name__)
 
 
 # The verifier built by build_auth(), exposed so the API client can drop a token
@@ -118,7 +117,7 @@ class ICTokenVerifier(TokenVerifier):
         try:
             return await self._exchange_probe(token)
         except Exception as exc:  # never let the probe itself reject a request
-            _log(f"exchange probe errored ({type(exc).__name__}); allowing")
+            logger.warning("exchange probe errored (%s); allowing", type(exc).__name__)
             return True
 
     async def verify_token(self, token: str) -> AccessToken | None:
@@ -129,7 +128,7 @@ class ICTokenVerifier(TokenVerifier):
             # dashboard may have deactivated this token since we cached it.
             if await self._exchangeable(token):
                 return hit[1]
-            _log("cached token is no longer exchangeable; forcing re-auth")
+            logger.warning("cached token is no longer exchangeable; forcing re-auth")
             self._cache.pop(token, None)
             return None
 
@@ -145,20 +144,20 @@ class ICTokenVerifier(TokenVerifier):
                     headers={"Accept": "application/json"},
                 )
         except Exception as exc:  # network/timeout → fail closed, don't cache
-            _log(f"introspection FAILED (network): {type(exc).__name__}: {exc}")
+            logger.error("introspection FAILED (network): %s: %s", type(exc).__name__, exc)
             return None
 
         if resp.status_code != 200:
             # 401 here means OUR client credentials are wrong (misconfig), not the
             # user's token. Either way, fail closed.
-            _log(f"introspection returned {resp.status_code}; rejecting")
+            logger.error("introspection returned %s; rejecting", resp.status_code)
             self._cache.pop(token, None)
             return None
 
         try:
             data = resp.json()
         except Exception:
-            _log("introspection response was not JSON; rejecting")
+            logger.error("introspection response was not JSON; rejecting")
             return None
 
         if not data.get("active"):
@@ -171,9 +170,8 @@ class ICTokenVerifier(TokenVerifier):
         aud = data.get("aud")
         audiences = [aud] if isinstance(aud, str) else (aud or [])
         if self._resource not in audiences:
-            _log(
-                f"token audience {aud!r} != our resource "
-                f"{self._resource!r}; rejecting"
+            logger.warning(
+                "token audience %r != our resource %r; rejecting", aud, self._resource
             )
             return None
 
@@ -192,7 +190,7 @@ class ICTokenVerifier(TokenVerifier):
         # Introspection says the token is live; confirm it is actually exchangeable
         # before admitting it, so the tool never discovers the problem instead.
         if not await self._exchangeable(token):
-            _log("token introspects active but is not exchangeable; rejecting")
+            logger.warning("token introspects active but is not exchangeable; rejecting")
             return None
 
         # Trust the introspection result for a short window; never past the token's
@@ -229,8 +227,8 @@ def build_auth() -> tuple[ICTokenVerifier | None, AuthSettings | None]:
         return None, None
 
     if not cfg.client_id or not cfg.client_secret:
-        _log(
-            "WARNING: MCP_OAUTH_ENABLED but MCP_OAUTH_CLIENT_ID/SECRET are not set — "
+        logger.warning(
+            "MCP_OAUTH_ENABLED but MCP_OAUTH_CLIENT_ID/SECRET are not set — "
             "introspection will fail closed (all tokens rejected)."
         )
 
@@ -249,8 +247,10 @@ def build_auth() -> tuple[ICTokenVerifier | None, AuthSettings | None]:
         resource_server_url=cfg.resource,
         required_scopes=cfg.scopes or None,
     )
-    _log(
-        f"OAuth enabled — issuer={cfg.issuer} resource={cfg.resource} "
-        f"required_scopes={cfg.scopes or '(none)'}"
+    logger.info(
+        "OAuth enabled — issuer=%s resource=%s required_scopes=%s",
+        cfg.issuer,
+        cfg.resource,
+        cfg.scopes or "(none)",
     )
     return verifier, settings

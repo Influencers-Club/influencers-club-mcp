@@ -6,9 +6,9 @@ bypassing Claude's context window limitations for large CSV files.
 """
 
 import json
+import logging
 import os
 import re
-import sys
 import threading
 import time
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -38,8 +38,7 @@ UPLOAD_BIND = os.environ.get("UPLOAD_BIND", "127.0.0.1")
 MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB
 
 
-def _log(msg: str) -> None:
-    print(f"[Upload] {msg}", file=sys.stderr)
+logger = logging.getLogger(__name__)
 
 
 def _sanitize_filename(name: str) -> str:
@@ -517,7 +516,7 @@ class UploadHandler(BaseHTTPRequestHandler):
                 body = '\n'.join(lines).encode('utf-8')
                 columns_stripped = True
                 header_fixed = True
-                _log(f"Stripped to single column (col {best_col_idx}), header set to '{detected_type}'")
+                logger.info("Stripped to single column (col %s), header set to '%s'", best_col_idx, detected_type)
 
             else:
                 # Single column — just fix the header if needed
@@ -539,7 +538,7 @@ class UploadHandler(BaseHTTPRequestHandler):
                     lines[0] = detected_type
                     body = '\n'.join(lines).encode('utf-8')
                     header_fixed = True
-                    _log(f"Auto-fixed header: '{first_col}' -> '{detected_type}'")
+                    logger.info("Auto-fixed header: '%s' -> '%s'", first_col, detected_type)
 
             row_count = len(lines) - 1
 
@@ -555,7 +554,7 @@ class UploadHandler(BaseHTTPRequestHandler):
                 save_path = imports / filename
 
             save_path.write_bytes(body)
-            _log(f"Saved {filename} ({row_count} rows, {content_length} bytes)")
+            logger.info("Saved %s (%s rows, %s bytes)", filename, row_count, content_length)
 
             import_host_dir = os.environ.get('IMPORT_HOST_DIR', '')
             host_path = os.path.join(import_host_dir, filename) if import_host_dir else filename
@@ -578,7 +577,7 @@ class UploadHandler(BaseHTTPRequestHandler):
             self._send_json(200, resp)
 
         except Exception as e:
-            _log(f"Upload error: {e}")
+            logger.exception("Upload error: %s", e)
             self._send_json(500, {'error': True, 'message': str(e)})
 
     # ── Utilities ──
@@ -597,7 +596,7 @@ class UploadHandler(BaseHTTPRequestHandler):
         pass
 
     def log_message(self, format, *args):
-        _log(format % args)
+        logger.info(format, *args)
 
 
 # ─── Server start ──────────────────────────────────────────────────────
@@ -610,8 +609,8 @@ def start_upload_server() -> HTTPServer | None:
         server = HTTPServer((UPLOAD_BIND, UPLOAD_PORT), UploadHandler)
         thread = threading.Thread(target=server.serve_forever, daemon=True, name='upload-server')
         thread.start()
-        _log(f"File upload server running on http://{UPLOAD_BIND}:{UPLOAD_PORT}")
+        logger.info("File upload server running on http://%s:%s", UPLOAD_BIND, UPLOAD_PORT)
         return server
     except OSError as e:
-        _log(f"Could not start upload server on port {UPLOAD_PORT}: {e}")
+        logger.warning("Could not start upload server on port %s: %s", UPLOAD_PORT, e)
         return None

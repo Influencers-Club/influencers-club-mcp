@@ -7,6 +7,7 @@ discovery, batch operations, content data, and account management.
 
 import asyncio
 import json
+import logging
 import os
 import re
 import time as _time
@@ -19,9 +20,12 @@ from mcp.server.fastmcp.server import TransportSecuritySettings
 from mcp.server.lowlevel.server import request_ctx
 from pydantic import Field
 
-from .api_client import ApiError, InfluencersApiClient, _log, _sanitize
+from .api_client import ApiError, InfluencersApiClient, _sanitize
 from .csv_export import creators_to_csv
 from .discovery_filters import DiscoveryFilters, coerce_filters
+from .log_config import configure_logging
+
+logger = logging.getLogger(__name__)
 
 # ─── Constants ─────────────────────────────────────────────────────────
 API_V1 = "/public/v1"
@@ -84,6 +88,10 @@ CREDIT_COSTS = {
 }
 
 # ─── Initialize ────────────────────────────────────────────────────────
+# Logging first: build_auth() below already logs, and FastMCP() only installs
+# its own line-wrapping handler while the root logger is still unconfigured.
+LOG_LEVEL = configure_logging()
+
 # Hosted (HTTP) mode is on whenever MCP_TRANSPORT selects an HTTP transport.
 # Used to (a) configure DNS-rebinding/Origin protection, (b) gate localhost-only
 # tools that don't make sense on shared infra.
@@ -155,6 +163,7 @@ _INSTRUCTIONS_STDIO_EXTRAS = (
 mcp = FastMCP(
     "influencers-club",
     instructions=_INSTRUCTIONS_CORE + ("" if HTTP_MODE else _INSTRUCTIONS_STDIO_EXTRAS),
+    log_level=LOG_LEVEL,
     **_mcp_kwargs,
 )
 
@@ -240,9 +249,12 @@ if HTTP_MODE:
             # credentials. The REQUEST body is never logged — it carries the refresh
             # token, the auth code and the PKCE verifier.
             grant = re.search(rb"grant_type=([A-Za-z0-9_.:%-]+)", body)
-            _log(
-                f"oauth-proxy {path} grant={grant.group(1).decode() if grant else '?'} "
-                f"-> {r.status_code}: {_sanitize(r.text[:300])}"
+            logger.warning(
+                "oauth-proxy %s grant=%s -> %s: %s",
+                path,
+                grant.group(1).decode() if grant else "?",
+                r.status_code,
+                _sanitize(r.text[:300]),
             )
         return Response(
             content=r.content,
@@ -479,7 +491,6 @@ def _error_response(e: Exception) -> str:
 
 def _get_mcp_client_name() -> str:
     """Return the MCP clientInfo.name for the current request, or empty string if unavailable."""
-    import sys
     try:
         ctx = request_ctx.get()
         # Try multiple paths — MCP library versions differ in structure
@@ -502,10 +513,10 @@ def _get_mcp_client_name() -> str:
                         name = getattr(ci, "name", "") or ""
             except Exception:
                 pass
-        print(f"[IC-MCP] client_name detected: '{name}'", file=sys.stderr)
+        logger.debug("client_name detected: '%s'", name)
         return name
     except Exception as exc:
-        print(f"[IC-MCP] client_name detection failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+        logger.warning("client_name detection failed: %s: %s", type(exc).__name__, exc)
         return ""
 
 
@@ -1805,7 +1816,6 @@ async def _filtered_list_tools_handler(req: _mcp_types.ListToolsRequest):
         return result  # Claude Code sees everything
 
     # Non-Claude Code: filter batch tools from the result and cache
-    import sys
     tools_result = result.root  # ServerResult wraps ListToolsResult
     original_count = len(tools_result.tools)
     tools_result.tools = [t for t in tools_result.tools if t.name not in _BATCH_TOOLS]
@@ -1816,7 +1826,7 @@ async def _filtered_list_tools_handler(req: _mcp_types.ListToolsRequest):
         mcp._mcp_server._tool_cache.pop(name, None)
 
     if filtered_count:
-        print(f"[IC-MCP] Hidden {filtered_count} batch tools from client '{client}'", file=sys.stderr)
+        logger.debug("Hidden %s batch tools from client '%s'", filtered_count, client)
 
     return result
 
