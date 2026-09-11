@@ -515,8 +515,8 @@ def _get_mcp_client_name() -> str:
                 pass
         logger.debug("client_name detected: '%s'", name)
         return name
-    except Exception as exc:
-        logger.warning("client_name detection failed: %s: %s", type(exc).__name__, exc)
+    except Exception:
+        logger.exception("client_name detection failed")
         return ""
 
 

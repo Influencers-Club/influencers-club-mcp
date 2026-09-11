@@ -116,8 +116,8 @@ class ICTokenVerifier(TokenVerifier):
             return True
         try:
             return await self._exchange_probe(token)
-        except Exception as exc:  # never let the probe itself reject a request
-            logger.warning("exchange probe errored (%s); allowing", type(exc).__name__)
+        except Exception:  # never let the probe itself reject a request
+            logger.exception("exchange probe errored; allowing")
             return True
 
     async def verify_token(self, token: str) -> AccessToken | None:
@@ -143,8 +143,8 @@ class ICTokenVerifier(TokenVerifier):
                     },
                     headers={"Accept": "application/json"},
                 )
-        except Exception as exc:  # network/timeout → fail closed, don't cache
-            logger.error("introspection FAILED (network): %s: %s", type(exc).__name__, exc)
+        except Exception:  # network/timeout → fail closed, don't cache
+            logger.exception("introspection FAILED (network)")
             return None
 
         if resp.status_code != 200:
@@ -157,7 +157,7 @@ class ICTokenVerifier(TokenVerifier):
         try:
             data = resp.json()
         except Exception:
-            logger.error("introspection response was not JSON; rejecting")
+            logger.exception("introspection response was not JSON; rejecting")
             return None
 
         if not data.get("active"):

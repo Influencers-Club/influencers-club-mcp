@@ -577,7 +577,7 @@ class UploadHandler(BaseHTTPRequestHandler):
             self._send_json(200, resp)
 
         except Exception as e:
-            logger.exception("Upload error: %s", e)
+            logger.exception("Upload error")
             self._send_json(500, {'error': True, 'message': str(e)})
 
     # ── Utilities ──
