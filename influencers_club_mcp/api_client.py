@@ -9,20 +9,12 @@ import logging
 import os
 import re
 import time
-from typing import Any
+from typing import Any, Callable
 
 import httpx
 
 from .auth import invalidate_cached_token
 from .oauth_config import load_oauth_config
-
-try:
-    # Available when running under FastMCP HTTP transport with auth wired up.
-    # In stdio mode this import succeeds but get_access_token() returns None.
-    from mcp.server.auth.middleware.auth_context import get_access_token
-except Exception:  # pragma: no cover — defensive against package layout drift
-    def get_access_token():  # type: ignore[misc]
-        return None
 
 DEFAULT_TIMEOUT = 30.0
 BATCH_TIMEOUT = 60.0
@@ -80,15 +72,19 @@ class InfluencersApiClient:
 
     Token resolution is per-request to support both modes:
       - stdio (single-tenant): token comes from INFLUENCERS_CLUB_API_KEY env var
-      - HTTP (multi-tenant, post-OAuth): token comes from the authenticated
-        request via FastMCP's auth context (get_access_token).
+      - HTTP (multi-tenant, OAuth): the server passes ``request_token``, which
+        returns the token verified for the HTTP request that carried the current
+        message; the client exchanges that and never falls back to the env key.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, request_token: Callable[[], str | None] | None = None) -> None:
         env_key = os.environ.get("INFLUENCERS_CLUB_API_KEY", "").strip()
         if env_key.startswith("Bearer "):
             env_key = env_key[7:].strip()
         self._env_api_key = env_key  # may be empty in HTTP mode
+        # OAuth (HTTP) mode: how the server finds the token the current call's own
+        # request was authenticated with. None in stdio and in HTTP without OAuth.
+        self._request_token = request_token
 
         # OAuth (HTTP) mode: the dashboard base + confidential client come from the
         # shared resolver, so introspection (auth), token-exchange and API calls
@@ -108,15 +104,20 @@ class InfluencersApiClient:
     async def _resolve_token(self) -> str:
         """Resolve the bearer token to send to the dashboard API.
 
-        OAuth (HTTP) mode: the per-request access token is the user's MCP-audience
-        token; per RFC 8693 we MUST NOT forward it to the API. Instead we exchange
-        it (as a confidential client) for a separate dashboard-audience token and
-        send that. stdio mode: fall back to the single env API key.
+        OAuth (HTTP) mode: the token on the request that carried this call is the
+        user's MCP-audience token; per RFC 8693 we MUST NOT forward it to the API.
+        Instead we exchange it (as a confidential client) for a separate
+        dashboard-audience token and send that. A call with no authenticated
+        request behind it is refused, never served with another credential.
+        stdio mode: the single env API key.
         """
-        access_token = get_access_token()
-        if access_token and access_token.token:
-            tok = access_token.token
-            user_token = tok[7:].strip() if tok.startswith("Bearer ") else tok
+        if self._request_token is not None:
+            user_token = self._request_token()
+            if not user_token:
+                logger.error("no authenticated request behind this call; refusing it")
+                raise ApiError(
+                    401, "No authenticated request for this call; re-authenticate."
+                )
             return await self._exchange_token(user_token)
         if self._env_api_key:
             return self._env_api_key

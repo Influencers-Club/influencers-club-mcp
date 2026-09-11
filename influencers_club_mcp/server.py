@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated, Any, Optional
 
+from mcp.server.auth.middleware.bearer_auth import AuthenticatedUser
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.server import TransportSecuritySettings
 from mcp.server.lowlevel.server import request_ctx
@@ -270,7 +271,30 @@ if HTTP_MODE:
     async def oauth_register(request: Request) -> Response:
         return await _proxy_post(request, "/public/v1/oauth/register/")
 
-client = InfluencersApiClient()
+
+def _request_token() -> str | None:
+    """The bearer token verified for the HTTP request that carried the current message.
+
+    Not get_access_token(): that reads a contextvar, and in stateful streamable HTTP
+    every message of a session is handled in a task started during the session's
+    initialize request, so it keeps returning the token the session was opened with
+    even after the client has rotated it. The SDK attaches each message's own HTTP
+    request to the request context, and the auth middleware leaves the user it
+    verified for that request in the request's scope.
+    """
+    ctx = request_ctx.get(None)  # None outside any message
+    user = ctx.request.scope.get("user") if ctx and ctx.request else None
+    if isinstance(user, AuthenticatedUser):
+        return user.access_token.token or None
+    return None
+
+
+# With OAuth on, every API call must use the token its own request was authenticated
+# with, so the client is handed the reader above and refuses a call without one
+# rather than fall back to the env key. The client itself knows nothing of the SDK.
+client = InfluencersApiClient(
+    request_token=_request_token if _token_verifier is not None else None
+)
 
 # Let the token verifier ask the API client whether a token is still exchangeable.
 # Wired here because the verifier is built before the client exists, and doing it
