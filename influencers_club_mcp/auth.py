@@ -17,6 +17,13 @@ credential — the upstream call uses a separately exchanged token (see
 Successful validations are cached for a short TTL so we don't introspect on every
 single MCP request (``verify_token`` runs per request).
 
+Two kinds of failure are kept apart. When the dashboard says the token is inactive
+or bound to another resource, ``verify_token`` returns ``None`` and the SDK answers
+401, which makes the client re-authenticate. When the dashboard gives no verdict at
+all — unreachable, erroring, unreadable — ``verify_token`` raises
+``IntrospectionUnavailable`` and ``IntrospectionUnavailableMiddleware`` answers 503
+instead, so a dashboard outage never looks like a bad token.
+
 Wiring lives in ``server.py`` and is only active in HTTP mode when
 ``MCP_OAUTH_ENABLED`` is truthy, so stdio and the current no-auth HTTP deploy
 are unaffected.
@@ -32,6 +39,8 @@ import httpx
 from cachetools import TLRUCache
 from mcp.server.auth.provider import AccessToken, TokenVerifier
 from mcp.server.auth.settings import AuthSettings
+from starlette.responses import JSONResponse
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 from .oauth_config import load_oauth_config
 
@@ -44,6 +53,41 @@ _INTROSPECT_PATH = "/public/v1/oauth/introspect/"
 _CACHE_MAXSIZE = 10_000
 
 logger = logging.getLogger(__name__)
+
+
+class IntrospectionUnavailable(Exception):
+    """Introspection gave no verdict on the token.
+
+    The dashboard could not be reached, answered with an error, or sent something
+    unreadable. Distinct from an inactive token, which verify_token reports by
+    returning None.
+    """
+
+
+class IntrospectionUnavailableMiddleware:
+    """Answer 503 when a token could not be verified for our reasons, not the client's.
+
+    The SDK's auth middleware turns every verify_token failure into a 401 with a
+    WWW-Authenticate challenge, which tells the client its token is bad and sends
+    the user through re-authentication. During a dashboard outage nothing about the
+    token is known, so that is the wrong signal. This sits outside the SDK's
+    middleware, catches IntrospectionUnavailable before the SDK can answer, and
+    returns 503 with Retry-After. Wired in server.py, only when OAuth is on.
+    """
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        try:
+            await self.app(scope, receive, send)
+        except IntrospectionUnavailable as exc:
+            response = JSONResponse(
+                {"error": "temporarily_unavailable", "error_description": str(exc)},
+                status_code=503,
+                headers={"Retry-After": "10"},
+            )
+            await response(scope, receive, send)
 
 
 # The verifier built by build_auth(), exposed so the API client can drop a token
@@ -162,22 +206,21 @@ class ICTokenVerifier(TokenVerifier):
                     },
                     headers={"Accept": "application/json"},
                 )
-        except Exception:  # network/timeout → fail closed, don't cache
+        except Exception as exc:  # network/timeout: no verdict on the token
             logger.exception("introspection FAILED (network)")
-            return None
+            raise IntrospectionUnavailable("introspection endpoint unreachable") from exc
 
         if resp.status_code != 200:
-            # 401 here means OUR client credentials are wrong (misconfig), not the
-            # user's token. Either way, fail closed.
-            logger.error("introspection returned %s; rejecting", resp.status_code)
-            self._cache.pop(token, None)
-            return None
+            # Not a verdict on the token either: 401/403 mean OUR client credentials
+            # or network path are wrong, 5xx means the dashboard is down.
+            logger.error("introspection returned %s; no verdict on the token", resp.status_code)
+            raise IntrospectionUnavailable(f"introspection returned HTTP {resp.status_code}")
 
         try:
             data = resp.json()
-        except Exception:
-            logger.exception("introspection response was not JSON; rejecting")
-            return None
+        except Exception as exc:
+            logger.exception("introspection response was not JSON")
+            raise IntrospectionUnavailable("introspection response was not JSON") from exc
 
         if not data.get("active"):
             self._cache.pop(token, None)

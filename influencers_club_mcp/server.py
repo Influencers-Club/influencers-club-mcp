@@ -22,6 +22,7 @@ from mcp.server.lowlevel.server import request_ctx
 from pydantic import Field
 
 from .api_client import ApiError, InfluencersApiClient, _sanitize
+from .auth import IntrospectionUnavailableMiddleware
 from .csv_export import creators_to_csv
 from .discovery_filters import DiscoveryFilters, coerce_filters
 from .log_config import configure_logging
@@ -161,7 +162,22 @@ _INSTRUCTIONS_STDIO_EXTRAS = (
     "The uploaded CSV needs a 'handle' or 'email' header.\n"
 )
 
-mcp = FastMCP(
+class _FastMCP(FastMCP):
+    """FastMCP whose HTTP app answers 503 while the dashboard cannot verify tokens.
+
+    The SDK builds its auth middleware inside streamable_http_app() and answers 401
+    to every verifier failure. IntrospectionUnavailableMiddleware has to sit outside
+    that stack, so it is added here, on the app the SDK hands back.
+    """
+
+    def streamable_http_app(self):
+        app = super().streamable_http_app()
+        if self._token_verifier is not None:
+            app.add_middleware(IntrospectionUnavailableMiddleware)
+        return app
+
+
+mcp = _FastMCP(
     "influencers-club",
     instructions=_INSTRUCTIONS_CORE + ("" if HTTP_MODE else _INSTRUCTIONS_STDIO_EXTRAS),
     log_level=LOG_LEVEL,
