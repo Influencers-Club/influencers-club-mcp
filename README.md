@@ -272,6 +272,7 @@ After configuring, restart your client. The server will appear as "influencers-c
 | `EXPORT_HOST_DIR` | No | — | Host path for exported files |
 | `IMPORT_HOST_DIR` | No | — | Host path for uploaded files |
 | `MAX_CALLS_PER_MINUTE` | No | 300 | Client-side rate limit |
+| `LOG_LEVEL` | No | INFO | Log verbosity on stderr: `DEBUG`, `INFO`, `WARNING`, `ERROR` or `CRITICAL` |
 
 ## Troubleshooting
 

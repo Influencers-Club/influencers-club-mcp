@@ -33,6 +33,11 @@ jobs:
       - name: Syntax check (compileall)
         run: python -m compileall -q influencers_club_mcp
 
+      - name: Unit tests
+        run: |
+          pip install pytest
+          pytest -q tests
+
       - name: Smoke test — stdio mode
         env:
           INFLUENCERS_CLUB_API_KEY: dummy_for_ci

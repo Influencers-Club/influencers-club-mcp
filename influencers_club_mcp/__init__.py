@@ -1,11 +1,13 @@
 """Influencers Club MCP Server."""
 
+import logging
 import os
-import sys
 
 from .server import mcp
 
 __all__ = ["mcp"]
+
+logger = logging.getLogger(__name__)
 
 
 def main():
@@ -21,15 +23,12 @@ def main():
         # Remote hosted mode (Phase 3 — paired with OAuth on the dashboard).
         # The upload server is intentionally NOT started: localhost file flows
         # have no meaning when the MCP runs on shared infra.
-        print("[MCP] Starting in streamable-http mode", file=sys.stderr)
+        logger.info("Starting in streamable-http mode")
         mcp.run(transport="streamable-http")
         return
 
     if transport != "stdio":
-        print(
-            f"[MCP] Unknown MCP_TRANSPORT='{transport}', falling back to stdio",
-            file=sys.stderr,
-        )
+        logger.warning("Unknown MCP_TRANSPORT='%s', falling back to stdio", transport)
 
     # Local mode: keep the existing behaviour exactly.
     from .upload_server import start_upload_server

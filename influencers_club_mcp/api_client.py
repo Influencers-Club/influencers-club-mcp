@@ -5,9 +5,9 @@ credential redaction, and debug logging to stderr.
 """
 
 import json
+import logging
 import os
 import re
-import sys
 import time
 from typing import Any
 
@@ -37,9 +37,7 @@ def _sanitize(text: str) -> str:
     return _BEARER_RE.sub("Bearer [REDACTED]", text)
 
 
-def _log(msg: str) -> None:
-    """Log to stderr (stdio servers must not write to stdout)."""
-    print(f"[MCP] {msg}", file=sys.stderr)
+logger = logging.getLogger(__name__)
 
 
 class RateLimitError(Exception):
@@ -184,9 +182,8 @@ class InfluencersApiClient:
                 # 4xx only: these bodies are fixed OAuth error strings, whereas a
                 # 5xx on a DEBUG=True env renders a traceback whose locals hold the
                 # subject token and client secret.
-                _log(
-                    f"token-exchange {resp.status_code}: "
-                    f"{_sanitize(resp.text[:300])}"
+                logger.warning(
+                    "token-exchange %s: %s", resp.status_code, _sanitize(resp.text[:300])
                 )
                 if "invalid_grant" in resp.text:
                     # The dashboard will not exchange this subject token, which means
@@ -199,9 +196,10 @@ class InfluencersApiClient:
                     # user re-authorizes by hand, whereas 401 is the signal to renew.
                     self._exchange_cache.pop(user_token, None)
                     evicted = invalidate_cached_token(user_token)
-                    _log(
+                    logger.warning(
                         "token-exchange rejected the subject token; cleared "
-                        f"admission cache (hit={evicted}) and signalling re-auth"
+                        "admission cache (hit=%s) and signalling re-auth",
+                        evicted,
                     )
                     raise ApiError(
                         401,
@@ -265,7 +263,7 @@ class InfluencersApiClient:
         self, path: str, params: dict[str, str] | None = None, timeout: float = DEFAULT_TIMEOUT
     ) -> Any:
         """Make a GET request."""
-        _log(f"GET {path} params={params}")
+        logger.info("GET %s params=%s", path, params)
         client = await self._get_client()
         try:
             # Inside the try so RateLimitError normalizes to ApiError(429, retryable=True)
@@ -276,7 +274,7 @@ class InfluencersApiClient:
                 headers=await self._headers(),
                 timeout=timeout,
             )
-            _log(f"GET {path} -> {resp.status_code}")
+            logger.info("GET %s -> %s", path, resp.status_code)
             resp.raise_for_status()
             content_type = resp.headers.get("content-type", "")
             if "application/json" in content_type:
@@ -287,7 +285,7 @@ class InfluencersApiClient:
 
     async def post(self, path: str, body: dict[str, Any], timeout: float = DEFAULT_TIMEOUT) -> Any:
         """Make a POST request with JSON body."""
-        _log(f"POST {path}")
+        logger.info("POST %s", path)
         client = await self._get_client()
         try:
             self._rate_limiter.check()
@@ -297,7 +295,7 @@ class InfluencersApiClient:
                 headers={**(await self._headers()), "Content-Type": "application/json"},
                 timeout=timeout,
             )
-            _log(f"POST {path} -> {resp.status_code}")
+            logger.info("POST %s -> %s", path, resp.status_code)
             resp.raise_for_status()
             return resp.json()
         except Exception as e:
@@ -307,7 +305,7 @@ class InfluencersApiClient:
         self, path: str, files: dict, data: dict[str, str], timeout: float = BATCH_TIMEOUT
     ) -> Any:
         """Make a POST request with multipart/form-data (for batch uploads)."""
-        _log(f"POST {path} (multipart) mode={data.get('enrichment_mode', '?')}")
+        logger.info("POST %s (multipart) mode=%s", path, data.get("enrichment_mode", "?"))
         client = await self._get_client()
         try:
             self._rate_limiter.check()
@@ -318,7 +316,7 @@ class InfluencersApiClient:
                 headers=await self._headers(),
                 timeout=timeout,
             )
-            _log(f"POST {path} -> {resp.status_code}")
+            logger.info("POST %s -> %s", path, resp.status_code)
             resp.raise_for_status()
             return resp.json()
         except Exception as e:
