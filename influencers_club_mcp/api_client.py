@@ -9,9 +9,10 @@ import logging
 import os
 import re
 import time
-from typing import Any, Callable
+from typing import Any, Callable, NamedTuple
 
 import httpx
+from cachetools import TLRUCache
 
 from .auth import invalidate_cached_token
 from .oauth_config import load_oauth_config
@@ -20,6 +21,9 @@ DEFAULT_TIMEOUT = 30.0
 BATCH_TIMEOUT = 60.0
 RATE_LIMIT = 300  # requests per minute
 RATE_WINDOW = 60.0  # seconds
+# Upper bound on cached token exchanges. Each entry lapses at its own deadline and
+# lapsed entries are dropped whenever a live one is stored; the bound caps the rest.
+EXCHANGE_CACHE_MAXSIZE = 10_000
 
 _BEARER_RE = re.compile(r"Bearer\s+\S+")
 
@@ -67,6 +71,19 @@ class _SlidingWindowRateLimiter:
         self._timestamps.append(now)
 
 
+class _ExchangedToken(NamedTuple):
+    """A dashboard token from token exchange and how long the dashboard said it lives."""
+
+    access_token: str
+    expires_in: int
+
+
+def _reuse_until(_user_token: str, exchanged: _ExchangedToken, now: float) -> float:
+    """When a cached exchange lapses: 30 s before the dashboard token expires, so we
+    never send a just-expired one. TLRUCache calls this as the entry is stored."""
+    return now + exchanged.expires_in - 30
+
+
 class InfluencersApiClient:
     """Async HTTP client for the Influencers.club API.
 
@@ -93,9 +110,11 @@ class InfluencersApiClient:
         self._base_url = _oauth.api_base
         self._oauth_client_id = _oauth.client_id
         self._oauth_client_secret = _oauth.client_secret
-        # Per-subject-token cache of exchanged dashboard tokens:
-        # {user_token: (dashboard_token, monotonic_expiry)}.
-        self._exchange_cache: dict[str, tuple[str, float]] = {}
+        # Per-subject-token cache of exchanged dashboard tokens: user_token ->
+        # _ExchangedToken, each entry lapsing shortly before its token expires.
+        self._exchange_cache = TLRUCache(
+            maxsize=EXCHANGE_CACHE_MAXSIZE, ttu=_reuse_until, timer=time.time
+        )
 
         max_rate = int(os.environ.get("MAX_CALLS_PER_MINUTE", str(RATE_LIMIT)))
         self._rate_limiter = _SlidingWindowRateLimiter(max_rate, RATE_WINDOW)
@@ -152,10 +171,9 @@ class InfluencersApiClient:
         """Exchange the user's MCP-audience token for a dashboard-audience token
         (RFC 8693 token exchange), authenticating as the MCP confidential client.
         Cached per user token until shortly before the exchanged token expires."""
-        now = time.monotonic()
-        hit = self._exchange_cache.get(user_token)
-        if hit and hit[1] > now:
-            return hit[0]
+        cached = self._exchange_cache.get(user_token)
+        if cached is not None:
+            return cached.access_token
         if not self._oauth_client_id or not self._oauth_client_secret:
             raise ApiError(
                 500,
@@ -213,9 +231,11 @@ class InfluencersApiClient:
         dash_token = payload.get("access_token")
         if not dash_token:
             raise ApiError(502, "Token exchange returned no access_token.")
-        # Re-exchange ~30s before expiry so we never send a just-expired token.
-        ttl = max(int(payload.get("expires_in") or 0) - 30, 0)
-        self._exchange_cache[user_token] = (dash_token, now + ttl)
+        # Stored with its lifetime; _reuse_until turns that into the deadline. A
+        # token already inside the 30 s margin is simply not cached.
+        self._exchange_cache[user_token] = _ExchangedToken(
+            dash_token, int(payload.get("expires_in") or 0)
+        )
         return dash_token
 
     async def _get_client(self) -> httpx.AsyncClient:

@@ -27,16 +27,16 @@ jobs:
           python-version: ${{ matrix.python-version }}
           cache: pip
 
-      - name: Install package
-        run: pip install -e .
+      - name: Install package and the test group
+        run: |
+          python -m pip install --upgrade pip  # --group needs pip >= 25.1
+          pip install -e . --group test
 
       - name: Syntax check (compileall)
         run: python -m compileall -q influencers_club_mcp
 
       - name: Unit tests
-        run: |
-          pip install pytest
-          pytest -q tests
+        run: pytest -q tests
 
       - name: Smoke test — stdio mode
         env:

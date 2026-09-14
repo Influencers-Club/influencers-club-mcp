@@ -29,6 +29,7 @@ import time
 from typing import Awaitable, Callable
 
 import httpx
+from cachetools import TLRUCache
 from mcp.server.auth.provider import AccessToken, TokenVerifier
 from mcp.server.auth.settings import AuthSettings
 
@@ -37,6 +38,10 @@ from .oauth_config import load_oauth_config
 # RFC 7662 token-introspection endpoint on the dashboard.
 _INTROSPECT_PATH = "/public/v1/oauth/introspect/"
 
+# Upper bound on cached admissions. Each entry lapses at its own deadline and
+# lapsed entries are dropped whenever a live one is stored, so tokens nobody
+# presents again don't pile up; the bound caps how many can be live at once.
+_CACHE_MAXSIZE = 10_000
 
 logger = logging.getLogger(__name__)
 
@@ -58,11 +63,11 @@ def invalidate_cached_token(token: str) -> bool:
     with invalid_grant. Dropping the entry here makes the next request re-introspect,
     get the authoritative answer, and return a 401 the client can recover from.
 
-    Returns True if an entry was removed (i.e. this token really was cached).
+    Returns True if a live entry was removed (i.e. this token really was cached).
     """
     if _ACTIVE_VERIFIER is None:
         return False
-    return _ACTIVE_VERIFIER._cache.pop(token, None) is not None
+    return _ACTIVE_VERIFIER.invalidate(token)
 
 
 class ICTokenVerifier(TokenVerifier):
@@ -88,8 +93,23 @@ class ICTokenVerifier(TokenVerifier):
         self._resource = resource_url
         self._scopes = scopes
         self._cache_ttl = cache_ttl
-        self._cache: dict[str, tuple[float, AccessToken]] = {}
+        # token -> admitted AccessToken; each entry lapses at its own deadline.
+        self._cache = TLRUCache(
+            maxsize=_CACHE_MAXSIZE, ttu=self._trusted_until, timer=time.time
+        )
         self._exchange_probe: Callable[[str], Awaitable[bool]] | None = None
+
+    def _trusted_until(self, _token: str, access: AccessToken, now: float) -> float:
+        """When a cached admission lapses: cache_ttl from when it was stored, but
+        never past the token's own expiry. TLRUCache calls this as the entry is stored."""
+        deadline = now + self._cache_ttl
+        if access.expires_at is not None:
+            deadline = min(deadline, float(access.expires_at))
+        return deadline
+
+    def invalidate(self, token: str) -> bool:
+        """Drop a cached admission; True if a live entry was removed."""
+        return self._cache.pop(token, None) is not None
 
     def set_exchange_probe(self, probe: Callable[[str], Awaitable[bool]]) -> None:
         """Register the check that decides whether a token is still exchangeable.
@@ -121,13 +141,12 @@ class ICTokenVerifier(TokenVerifier):
             return True
 
     async def verify_token(self, token: str) -> AccessToken | None:
-        now = time.monotonic()
-        hit = self._cache.get(token)
-        if hit and hit[0] > now:
+        cached = self._cache.get(token)
+        if cached is not None:
             # Cached admission is exactly where the stale-token bug lives: the
             # dashboard may have deactivated this token since we cached it.
             if await self._exchangeable(token):
-                return hit[1]
+                return cached
             logger.warning("cached token is no longer exchangeable; forcing re-auth")
             self._cache.pop(token, None)
             return None
@@ -193,12 +212,9 @@ class ICTokenVerifier(TokenVerifier):
             logger.warning("token introspects active but is not exchangeable; rejecting")
             return None
 
-        # Trust the introspection result for a short window; never past the token's
-        # own expiry.
-        ttl = self._cache_ttl
-        if exp:
-            ttl = min(ttl, max(int(exp) - int(time.time()), 0))
-        self._cache[token] = (now + ttl, access)
+        # Trust the introspection result for a short window; _trusted_until caps
+        # it at the token's own expiry.
+        self._cache[token] = access
         return access
 
 
