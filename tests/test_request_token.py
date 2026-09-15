@@ -157,15 +157,21 @@ OAUTH_ENV = {
 
 
 @pytest.mark.parametrize(
-    ("env", "wired"),
-    [({}, False), ({"MCP_TRANSPORT": "http"}, False), ({"MCP_TRANSPORT": "http", **OAUTH_ENV}, True)],
+    ("env", "wired", "stateless"),
+    [
+        ({}, False, False),
+        ({"MCP_TRANSPORT": "http"}, False, True),
+        ({"MCP_TRANSPORT": "http", **OAUTH_ENV}, True, True),
+    ],
     ids=["stdio", "http-without-oauth", "http-with-oauth"],
 )
-def test_server_hands_its_client_the_request_token_reader_exactly_when_oauth_is_wired(env, wired):
-    """server.py's own client, imported fresh in each deployment mode.
+def test_server_wiring_follows_the_deployment_mode(env, wired, stateless):
+    """server.py imported fresh in each deployment mode.
 
-    Without the reader with OAuth on, calls would go out on the shared env key
-    instead of each user's token; with it but no OAuth, every call would be refused.
+    The client gets the request-token reader exactly when OAuth is on: without it,
+    calls would go out on the shared env key instead of each user's token; with it
+    but no OAuth, every call would be refused. And only the hosted server runs
+    stateless: stdio keeps its session, HTTP must not depend on one.
     """
     inherited = {
         name: value
@@ -174,7 +180,8 @@ def test_server_hands_its_client_the_request_token_reader_exactly_when_oauth_is_
     }
     probe = (
         "from influencers_club_mcp import server; "
-        "print(server.client._request_token is server._request_token)"
+        "print(server.client._request_token is server._request_token, "
+        "server.mcp.settings.stateless_http)"
     )
     result = subprocess.run(
         [sys.executable, "-c", probe],
@@ -185,7 +192,7 @@ def test_server_hands_its_client_the_request_token_reader_exactly_when_oauth_is_
         errors="replace",
     )
     assert result.returncode == 0, result.stderr
-    assert result.stdout.split()[-1] == str(wired)
+    assert result.stdout.split()[-2:] == [str(wired), str(stateless)]
 
 
 class AdmitAll(TokenVerifier):
@@ -193,10 +200,11 @@ class AdmitAll(TokenVerifier):
         return access(token)
 
 
-def hosted_server() -> FastMCP:
-    """A server wired like hosted mode: bearer auth on every request, stateful sessions."""
+def hosted_server(stateless: bool = False) -> FastMCP:
+    """A server wired like hosted mode: bearer auth on every request."""
     server = FastMCP(
         "request-token-test",
+        stateless_http=stateless,
         token_verifier=AdmitAll(),
         auth=AuthSettings(issuer_url="https://auth.test", resource_server_url=RESOURCE),
         transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
@@ -221,7 +229,7 @@ async def post(
     return response
 
 
-async def open_session(http: httpx.AsyncClient, token: str) -> str:
+async def open_session(http: httpx.AsyncClient, token: str) -> str | None:
     response = await post(http, token, {
         "jsonrpc": "2.0", "id": 1, "method": "initialize",
         "params": {
@@ -230,12 +238,12 @@ async def open_session(http: httpx.AsyncClient, token: str) -> str:
             "clientInfo": {"name": "test", "version": "0"},
         },
     })
-    session = response.headers["mcp-session-id"]
+    session = response.headers.get("mcp-session-id")  # a stateless server issues none
     await post(http, token, {"jsonrpc": "2.0", "method": "notifications/initialized"}, session)
     return session
 
 
-async def call_tool(http: httpx.AsyncClient, token: str, session: str) -> str:
+async def call_tool(http: httpx.AsyncClient, token: str, session: str | None) -> str:
     response = await post(http, token, {
         "jsonrpc": "2.0", "id": 2, "method": "tools/call",
         "params": {"name": "dashboard_token", "arguments": {}},
@@ -246,9 +254,10 @@ async def call_tool(http: httpx.AsyncClient, token: str, session: str) -> str:
     return result["content"][0]["text"]
 
 
-def test_tool_calls_follow_token_rotation_within_a_session(exchanged):
-    """End to end through the SDK's stateful streamable-HTTP transport."""
-    server = hosted_server()
+@pytest.mark.parametrize("stateless", [False, True], ids=["stateful", "stateless"])
+def test_tool_calls_follow_token_rotation_within_a_session(exchanged, stateless):
+    """End to end through the SDK's streamable-HTTP transport, in both session modes."""
+    server = hosted_server(stateless)
     app = server.streamable_http_app()
 
     async def scenario():

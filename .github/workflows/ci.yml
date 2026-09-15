@@ -71,4 +71,6 @@ jobs:
                   f"unexpected host {mod.mcp.settings.host}"
               assert mod.mcp.settings.streamable_http_path == "/mcp", \
                   f"unexpected path {mod.mcp.settings.streamable_http_path}"
+              assert mod.mcp.settings.stateless_http is True, \
+                  "hosted server must run stateless: any instance serves any request"
           PY
