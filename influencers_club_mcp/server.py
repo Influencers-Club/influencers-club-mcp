@@ -6,6 +6,7 @@ discovery, batch operations, content data, and account management.
 """
 
 import asyncio
+import importlib.metadata
 import json
 import logging
 import os
@@ -122,6 +123,22 @@ if HTTP_MODE:
     _mcp_kwargs["host"] = os.environ.get("MCP_HOST", "0.0.0.0")
     _mcp_kwargs["port"] = int(os.environ.get("MCP_PORT", "8000"))
     _mcp_kwargs["streamable_http_path"] = os.environ.get("MCP_PATH", "/mcp")
+    # A throwaway transport and session per request, no Mcp-Session-Id. A stateful
+    # session lives in one process's memory, and the hosted server sits behind a
+    # load balancer with no stickiness: a request landing on another instance is a
+    # 404 "Session not found", and every deploy drops every session. Nothing here
+    # needs a session: no tool pushes progress, elicitation or sampling to the
+    # client. What it costs: a client's notifications/cancelled lands in its own
+    # throwaway session, so an interrupted tool call still finishes its one
+    # upstream request; only the initialize request ever sees clientInfo (see
+    # _get_mcp_client_name); and the SDK enters FastMCP's lifespan per request,
+    # so this server must never be given one.
+    _mcp_kwargs["stateless_http"] = True
+    # The SDK tears each request's transport down afterwards and says so at INFO
+    # ("Terminating session: None"), once per request; that logger has nothing
+    # else to say at INFO. Left alone when debugging, where its DEBUG lines matter.
+    if LOG_LEVEL != "DEBUG":
+        logging.getLogger("mcp.server.streamable_http").setLevel(logging.WARNING)
 
     # OAuth 2.1 resource-server mode (opt-in via MCP_OAUTH_ENABLED). Validates
     # dashboard-issued access tokens; the SDK then auto-serves the protected-
@@ -183,6 +200,10 @@ mcp = _FastMCP(
     log_level=LOG_LEVEL,
     **_mcp_kwargs,
 )
+# Stateless mode rebuilds the initialize options per request, and without a
+# version the SDK reads mcp's package metadata from disk each time. Pin it once;
+# the advertised serverInfo.version is the same value the SDK would look up.
+mcp._mcp_server.version = importlib.metadata.version("mcp")
 
 # Unauthenticated health probe for the ALB target group. See issue #13.
 if HTTP_MODE:
@@ -530,34 +551,16 @@ def _error_response(e: Exception) -> str:
 
 
 def _get_mcp_client_name() -> str:
-    """Return the MCP clientInfo.name for the current request, or empty string if unavailable."""
-    try:
-        ctx = request_ctx.get()
-        # Try multiple paths — MCP library versions differ in structure
-        name = ""
-        try:
-            name = ctx.session.client_params.clientInfo.name or ""
-        except AttributeError:
-            pass
-        if not name:
-            try:
-                name = ctx.session._client_params.clientInfo.name or ""
-            except AttributeError:
-                pass
-        if not name:
-            try:
-                cp = getattr(ctx.session, "client_params", None) or getattr(ctx.session, "_client_params", None)
-                if cp:
-                    ci = getattr(cp, "clientInfo", None) or getattr(cp, "client_info", None)
-                    if ci:
-                        name = getattr(ci, "name", "") or ""
-            except Exception:
-                pass
-        logger.debug("client_name detected: '%s'", name)
-        return name
-    except Exception:
-        logger.exception("client_name detection failed")
-        return ""
+    """The name the client gave at initialize, "" when the session never saw one.
+
+    Over stdio the session handled the client's initialize request. Over HTTP the
+    server is stateless (see the FastMCP kwargs above): every request gets a fresh
+    session that never saw an initialize, so this is always "" there, which callers
+    treat as the most restricted client.
+    """
+    ctx = request_ctx.get(None)  # None outside any message
+    params = ctx.session.client_params if ctx is not None else None
+    return params.clientInfo.name if params is not None else ""
 
 
 # ═══════════════════════════════════════════════════════════════════════
