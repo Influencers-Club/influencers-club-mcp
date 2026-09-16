@@ -17,6 +17,13 @@ credential — the upstream call uses a separately exchanged token (see
 Successful validations are cached for a short TTL so we don't introspect on every
 single MCP request (``verify_token`` runs per request).
 
+Two kinds of failure are kept apart. When the dashboard says the token is inactive
+or bound to another resource, ``verify_token`` returns ``None`` and the SDK answers
+401, which makes the client re-authenticate. When the dashboard gives no verdict at
+all — unreachable, erroring, unreadable — ``verify_token`` raises
+``IntrospectionUnavailable`` and ``IntrospectionUnavailableMiddleware`` answers 503
+instead, so a dashboard outage never looks like a bad token.
+
 Wiring lives in ``server.py`` and is only active in HTTP mode when
 ``MCP_OAUTH_ENABLED`` is truthy, so stdio and the current no-auth HTTP deploy
 are unaffected.
@@ -24,22 +31,63 @@ are unaffected.
 
 from __future__ import annotations
 
-import sys
+import logging
 import time
 from typing import Awaitable, Callable
 
 import httpx
+from cachetools import TLRUCache
 from mcp.server.auth.provider import AccessToken, TokenVerifier
 from mcp.server.auth.settings import AuthSettings
+from starlette.responses import JSONResponse
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 from .oauth_config import load_oauth_config
 
 # RFC 7662 token-introspection endpoint on the dashboard.
 _INTROSPECT_PATH = "/public/v1/oauth/introspect/"
 
+# Upper bound on cached admissions. Each entry lapses at its own deadline and
+# lapsed entries are dropped whenever a live one is stored, so tokens nobody
+# presents again don't pile up; the bound caps how many can be live at once.
+_CACHE_MAXSIZE = 10_000
 
-def _log(msg: str) -> None:
-    print(f"[MCP auth] {msg}", file=sys.stderr)
+logger = logging.getLogger(__name__)
+
+
+class IntrospectionUnavailable(Exception):
+    """Introspection gave no verdict on the token.
+
+    The dashboard could not be reached, answered with an error, or sent something
+    unreadable. Distinct from an inactive token, which verify_token reports by
+    returning None.
+    """
+
+
+class IntrospectionUnavailableMiddleware:
+    """Answer 503 when a token could not be verified for our reasons, not the client's.
+
+    The SDK's auth middleware turns every verify_token failure into a 401 with a
+    WWW-Authenticate challenge, which tells the client its token is bad and sends
+    the user through re-authentication. During a dashboard outage nothing about the
+    token is known, so that is the wrong signal. This sits outside the SDK's
+    middleware, catches IntrospectionUnavailable before the SDK can answer, and
+    returns 503 with Retry-After. Wired in server.py, only when OAuth is on.
+    """
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        try:
+            await self.app(scope, receive, send)
+        except IntrospectionUnavailable as exc:
+            response = JSONResponse(
+                {"error": "temporarily_unavailable", "error_description": str(exc)},
+                status_code=503,
+                headers={"Retry-After": "10"},
+            )
+            await response(scope, receive, send)
 
 
 # The verifier built by build_auth(), exposed so the API client can drop a token
@@ -59,11 +107,11 @@ def invalidate_cached_token(token: str) -> bool:
     with invalid_grant. Dropping the entry here makes the next request re-introspect,
     get the authoritative answer, and return a 401 the client can recover from.
 
-    Returns True if an entry was removed (i.e. this token really was cached).
+    Returns True if a live entry was removed (i.e. this token really was cached).
     """
     if _ACTIVE_VERIFIER is None:
         return False
-    return _ACTIVE_VERIFIER._cache.pop(token, None) is not None
+    return _ACTIVE_VERIFIER.invalidate(token)
 
 
 class ICTokenVerifier(TokenVerifier):
@@ -89,8 +137,23 @@ class ICTokenVerifier(TokenVerifier):
         self._resource = resource_url
         self._scopes = scopes
         self._cache_ttl = cache_ttl
-        self._cache: dict[str, tuple[float, AccessToken]] = {}
+        # token -> admitted AccessToken; each entry lapses at its own deadline.
+        self._cache = TLRUCache(
+            maxsize=_CACHE_MAXSIZE, ttu=self._trusted_until, timer=time.time
+        )
         self._exchange_probe: Callable[[str], Awaitable[bool]] | None = None
+
+    def _trusted_until(self, _token: str, access: AccessToken, now: float) -> float:
+        """When a cached admission lapses: cache_ttl from when it was stored, but
+        never past the token's own expiry. TLRUCache calls this as the entry is stored."""
+        deadline = now + self._cache_ttl
+        if access.expires_at is not None:
+            deadline = min(deadline, float(access.expires_at))
+        return deadline
+
+    def invalidate(self, token: str) -> bool:
+        """Drop a cached admission; True if a live entry was removed."""
+        return self._cache.pop(token, None) is not None
 
     def set_exchange_probe(self, probe: Callable[[str], Awaitable[bool]]) -> None:
         """Register the check that decides whether a token is still exchangeable.
@@ -117,19 +180,18 @@ class ICTokenVerifier(TokenVerifier):
             return True
         try:
             return await self._exchange_probe(token)
-        except Exception as exc:  # never let the probe itself reject a request
-            _log(f"exchange probe errored ({type(exc).__name__}); allowing")
+        except Exception:  # never let the probe itself reject a request
+            logger.exception("exchange probe errored; allowing")
             return True
 
     async def verify_token(self, token: str) -> AccessToken | None:
-        now = time.monotonic()
-        hit = self._cache.get(token)
-        if hit and hit[0] > now:
+        cached = self._cache.get(token)
+        if cached is not None:
             # Cached admission is exactly where the stale-token bug lives: the
             # dashboard may have deactivated this token since we cached it.
             if await self._exchangeable(token):
-                return hit[1]
-            _log("cached token is no longer exchangeable; forcing re-auth")
+                return cached
+            logger.warning("cached token is no longer exchangeable; forcing re-auth")
             self._cache.pop(token, None)
             return None
 
@@ -144,22 +206,21 @@ class ICTokenVerifier(TokenVerifier):
                     },
                     headers={"Accept": "application/json"},
                 )
-        except Exception as exc:  # network/timeout → fail closed, don't cache
-            _log(f"introspection FAILED (network): {type(exc).__name__}: {exc}")
-            return None
+        except Exception as exc:  # network/timeout: no verdict on the token
+            logger.exception("introspection FAILED (network)")
+            raise IntrospectionUnavailable("introspection endpoint unreachable") from exc
 
         if resp.status_code != 200:
-            # 401 here means OUR client credentials are wrong (misconfig), not the
-            # user's token. Either way, fail closed.
-            _log(f"introspection returned {resp.status_code}; rejecting")
-            self._cache.pop(token, None)
-            return None
+            # Not a verdict on the token either: 401/403 mean OUR client credentials
+            # or network path are wrong, 5xx means the dashboard is down.
+            logger.error("introspection returned %s; no verdict on the token", resp.status_code)
+            raise IntrospectionUnavailable(f"introspection returned HTTP {resp.status_code}")
 
         try:
             data = resp.json()
-        except Exception:
-            _log("introspection response was not JSON; rejecting")
-            return None
+        except Exception as exc:
+            logger.exception("introspection response was not JSON")
+            raise IntrospectionUnavailable("introspection response was not JSON") from exc
 
         if not data.get("active"):
             self._cache.pop(token, None)
@@ -171,9 +232,8 @@ class ICTokenVerifier(TokenVerifier):
         aud = data.get("aud")
         audiences = [aud] if isinstance(aud, str) else (aud or [])
         if self._resource not in audiences:
-            _log(
-                f"token audience {aud!r} != our resource "
-                f"{self._resource!r}; rejecting"
+            logger.warning(
+                "token audience %r != our resource %r; rejecting", aud, self._resource
             )
             return None
 
@@ -192,15 +252,12 @@ class ICTokenVerifier(TokenVerifier):
         # Introspection says the token is live; confirm it is actually exchangeable
         # before admitting it, so the tool never discovers the problem instead.
         if not await self._exchangeable(token):
-            _log("token introspects active but is not exchangeable; rejecting")
+            logger.warning("token introspects active but is not exchangeable; rejecting")
             return None
 
-        # Trust the introspection result for a short window; never past the token's
-        # own expiry.
-        ttl = self._cache_ttl
-        if exp:
-            ttl = min(ttl, max(int(exp) - int(time.time()), 0))
-        self._cache[token] = (now + ttl, access)
+        # Trust the introspection result for a short window; _trusted_until caps
+        # it at the token's own expiry.
+        self._cache[token] = access
         return access
 
 
@@ -229,8 +286,8 @@ def build_auth() -> tuple[ICTokenVerifier | None, AuthSettings | None]:
         return None, None
 
     if not cfg.client_id or not cfg.client_secret:
-        _log(
-            "WARNING: MCP_OAUTH_ENABLED but MCP_OAUTH_CLIENT_ID/SECRET are not set — "
+        logger.warning(
+            "MCP_OAUTH_ENABLED but MCP_OAUTH_CLIENT_ID/SECRET are not set — "
             "introspection will fail closed (all tokens rejected)."
         )
 
@@ -249,8 +306,10 @@ def build_auth() -> tuple[ICTokenVerifier | None, AuthSettings | None]:
         resource_server_url=cfg.resource,
         required_scopes=cfg.scopes or None,
     )
-    _log(
-        f"OAuth enabled — issuer={cfg.issuer} resource={cfg.resource} "
-        f"required_scopes={cfg.scopes or '(none)'}"
+    logger.info(
+        "OAuth enabled — issuer=%s resource=%s required_scopes=%s",
+        cfg.issuer,
+        cfg.resource,
+        cfg.scopes or "(none)",
     )
     return verifier, settings

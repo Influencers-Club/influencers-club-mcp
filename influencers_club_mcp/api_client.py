@@ -5,29 +5,25 @@ credential redaction, and debug logging to stderr.
 """
 
 import json
+import logging
 import os
 import re
-import sys
 import time
-from typing import Any
+from typing import Any, Callable, NamedTuple
 
 import httpx
+from cachetools import TLRUCache
 
 from .auth import invalidate_cached_token
 from .oauth_config import load_oauth_config
-
-try:
-    # Available when running under FastMCP HTTP transport with auth wired up.
-    # In stdio mode this import succeeds but get_access_token() returns None.
-    from mcp.server.auth.middleware.auth_context import get_access_token
-except Exception:  # pragma: no cover — defensive against package layout drift
-    def get_access_token():  # type: ignore[misc]
-        return None
 
 DEFAULT_TIMEOUT = 30.0
 BATCH_TIMEOUT = 60.0
 RATE_LIMIT = 300  # requests per minute
 RATE_WINDOW = 60.0  # seconds
+# Upper bound on cached token exchanges. Each entry lapses at its own deadline and
+# lapsed entries are dropped whenever a live one is stored; the bound caps the rest.
+EXCHANGE_CACHE_MAXSIZE = 10_000
 
 _BEARER_RE = re.compile(r"Bearer\s+\S+")
 
@@ -37,9 +33,7 @@ def _sanitize(text: str) -> str:
     return _BEARER_RE.sub("Bearer [REDACTED]", text)
 
 
-def _log(msg: str) -> None:
-    """Log to stderr (stdio servers must not write to stdout)."""
-    print(f"[MCP] {msg}", file=sys.stderr)
+logger = logging.getLogger(__name__)
 
 
 class RateLimitError(Exception):
@@ -77,20 +71,37 @@ class _SlidingWindowRateLimiter:
         self._timestamps.append(now)
 
 
+class _ExchangedToken(NamedTuple):
+    """A dashboard token from token exchange and how long the dashboard said it lives."""
+
+    access_token: str
+    expires_in: int
+
+
+def _reuse_until(_user_token: str, exchanged: _ExchangedToken, now: float) -> float:
+    """When a cached exchange lapses: 30 s before the dashboard token expires, so we
+    never send a just-expired one. TLRUCache calls this as the entry is stored."""
+    return now + exchanged.expires_in - 30
+
+
 class InfluencersApiClient:
     """Async HTTP client for the Influencers.club API.
 
     Token resolution is per-request to support both modes:
       - stdio (single-tenant): token comes from INFLUENCERS_CLUB_API_KEY env var
-      - HTTP (multi-tenant, post-OAuth): token comes from the authenticated
-        request via FastMCP's auth context (get_access_token).
+      - HTTP (multi-tenant, OAuth): the server passes ``request_token``, which
+        returns the token verified for the HTTP request that carried the current
+        message; the client exchanges that and never falls back to the env key.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, request_token: Callable[[], str | None] | None = None) -> None:
         env_key = os.environ.get("INFLUENCERS_CLUB_API_KEY", "").strip()
         if env_key.startswith("Bearer "):
             env_key = env_key[7:].strip()
         self._env_api_key = env_key  # may be empty in HTTP mode
+        # OAuth (HTTP) mode: how the server finds the token the current call's own
+        # request was authenticated with. None in stdio and in HTTP without OAuth.
+        self._request_token = request_token
 
         # OAuth (HTTP) mode: the dashboard base + confidential client come from the
         # shared resolver, so introspection (auth), token-exchange and API calls
@@ -99,9 +110,11 @@ class InfluencersApiClient:
         self._base_url = _oauth.api_base
         self._oauth_client_id = _oauth.client_id
         self._oauth_client_secret = _oauth.client_secret
-        # Per-subject-token cache of exchanged dashboard tokens:
-        # {user_token: (dashboard_token, monotonic_expiry)}.
-        self._exchange_cache: dict[str, tuple[str, float]] = {}
+        # Per-subject-token cache of exchanged dashboard tokens: user_token ->
+        # _ExchangedToken, each entry lapsing shortly before its token expires.
+        self._exchange_cache = TLRUCache(
+            maxsize=EXCHANGE_CACHE_MAXSIZE, ttu=_reuse_until, timer=time.time
+        )
 
         max_rate = int(os.environ.get("MAX_CALLS_PER_MINUTE", str(RATE_LIMIT)))
         self._rate_limiter = _SlidingWindowRateLimiter(max_rate, RATE_WINDOW)
@@ -110,15 +123,20 @@ class InfluencersApiClient:
     async def _resolve_token(self) -> str:
         """Resolve the bearer token to send to the dashboard API.
 
-        OAuth (HTTP) mode: the per-request access token is the user's MCP-audience
-        token; per RFC 8693 we MUST NOT forward it to the API. Instead we exchange
-        it (as a confidential client) for a separate dashboard-audience token and
-        send that. stdio mode: fall back to the single env API key.
+        OAuth (HTTP) mode: the token on the request that carried this call is the
+        user's MCP-audience token; per RFC 8693 we MUST NOT forward it to the API.
+        Instead we exchange it (as a confidential client) for a separate
+        dashboard-audience token and send that. A call with no authenticated
+        request behind it is refused, never served with another credential.
+        stdio mode: the single env API key.
         """
-        access_token = get_access_token()
-        if access_token and access_token.token:
-            tok = access_token.token
-            user_token = tok[7:].strip() if tok.startswith("Bearer ") else tok
+        if self._request_token is not None:
+            user_token = self._request_token()
+            if not user_token:
+                logger.error("no authenticated request behind this call; refusing it")
+                raise ApiError(
+                    401, "No authenticated request for this call; re-authenticate."
+                )
             return await self._exchange_token(user_token)
         if self._env_api_key:
             return self._env_api_key
@@ -153,10 +171,9 @@ class InfluencersApiClient:
         """Exchange the user's MCP-audience token for a dashboard-audience token
         (RFC 8693 token exchange), authenticating as the MCP confidential client.
         Cached per user token until shortly before the exchanged token expires."""
-        now = time.monotonic()
-        hit = self._exchange_cache.get(user_token)
-        if hit and hit[1] > now:
-            return hit[0]
+        cached = self._exchange_cache.get(user_token)
+        if cached is not None:
+            return cached.access_token
         if not self._oauth_client_id or not self._oauth_client_secret:
             raise ApiError(
                 500,
@@ -184,9 +201,8 @@ class InfluencersApiClient:
                 # 4xx only: these bodies are fixed OAuth error strings, whereas a
                 # 5xx on a DEBUG=True env renders a traceback whose locals hold the
                 # subject token and client secret.
-                _log(
-                    f"token-exchange {resp.status_code}: "
-                    f"{_sanitize(resp.text[:300])}"
+                logger.warning(
+                    "token-exchange %s: %s", resp.status_code, _sanitize(resp.text[:300])
                 )
                 if "invalid_grant" in resp.text:
                     # The dashboard will not exchange this subject token, which means
@@ -199,9 +215,10 @@ class InfluencersApiClient:
                     # user re-authorizes by hand, whereas 401 is the signal to renew.
                     self._exchange_cache.pop(user_token, None)
                     evicted = invalidate_cached_token(user_token)
-                    _log(
+                    logger.warning(
                         "token-exchange rejected the subject token; cleared "
-                        f"admission cache (hit={evicted}) and signalling re-auth"
+                        "admission cache (hit=%s) and signalling re-auth",
+                        evicted,
                     )
                     raise ApiError(
                         401,
@@ -214,9 +231,11 @@ class InfluencersApiClient:
         dash_token = payload.get("access_token")
         if not dash_token:
             raise ApiError(502, "Token exchange returned no access_token.")
-        # Re-exchange ~30s before expiry so we never send a just-expired token.
-        ttl = max(int(payload.get("expires_in") or 0) - 30, 0)
-        self._exchange_cache[user_token] = (dash_token, now + ttl)
+        # Stored with its lifetime; _reuse_until turns that into the deadline. A
+        # token already inside the 30 s margin is simply not cached.
+        self._exchange_cache[user_token] = _ExchangedToken(
+            dash_token, int(payload.get("expires_in") or 0)
+        )
         return dash_token
 
     async def _get_client(self) -> httpx.AsyncClient:
@@ -265,7 +284,7 @@ class InfluencersApiClient:
         self, path: str, params: dict[str, str] | None = None, timeout: float = DEFAULT_TIMEOUT
     ) -> Any:
         """Make a GET request."""
-        _log(f"GET {path} params={params}")
+        logger.info("GET %s params=%s", path, params)
         client = await self._get_client()
         try:
             # Inside the try so RateLimitError normalizes to ApiError(429, retryable=True)
@@ -276,7 +295,7 @@ class InfluencersApiClient:
                 headers=await self._headers(),
                 timeout=timeout,
             )
-            _log(f"GET {path} -> {resp.status_code}")
+            logger.info("GET %s -> %s", path, resp.status_code)
             resp.raise_for_status()
             content_type = resp.headers.get("content-type", "")
             if "application/json" in content_type:
@@ -287,7 +306,7 @@ class InfluencersApiClient:
 
     async def post(self, path: str, body: dict[str, Any], timeout: float = DEFAULT_TIMEOUT) -> Any:
         """Make a POST request with JSON body."""
-        _log(f"POST {path}")
+        logger.info("POST %s", path)
         client = await self._get_client()
         try:
             self._rate_limiter.check()
@@ -297,7 +316,7 @@ class InfluencersApiClient:
                 headers={**(await self._headers()), "Content-Type": "application/json"},
                 timeout=timeout,
             )
-            _log(f"POST {path} -> {resp.status_code}")
+            logger.info("POST %s -> %s", path, resp.status_code)
             resp.raise_for_status()
             return resp.json()
         except Exception as e:
@@ -307,7 +326,7 @@ class InfluencersApiClient:
         self, path: str, files: dict, data: dict[str, str], timeout: float = BATCH_TIMEOUT
     ) -> Any:
         """Make a POST request with multipart/form-data (for batch uploads)."""
-        _log(f"POST {path} (multipart) mode={data.get('enrichment_mode', '?')}")
+        logger.info("POST %s (multipart) mode=%s", path, data.get("enrichment_mode", "?"))
         client = await self._get_client()
         try:
             self._rate_limiter.check()
@@ -318,7 +337,7 @@ class InfluencersApiClient:
                 headers=await self._headers(),
                 timeout=timeout,
             )
-            _log(f"POST {path} -> {resp.status_code}")
+            logger.info("POST %s -> %s", path, resp.status_code)
             resp.raise_for_status()
             return resp.json()
         except Exception as e:
