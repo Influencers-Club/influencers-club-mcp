@@ -27,6 +27,10 @@ dependencies = [
     "mcp[cli]>=1.28.1,<2",
     "httpx>=0.27.0",
     "pydantic>=2.0.0",
+    # TLRUCache (per-entry expiry) backs the token caches; it arrived in 5.0.
+    # Capped below the next major like mcp above: it is imported at startup in
+    # every mode, so an incompatible release would break every fresh install.
+    "cachetools>=5.0,<8",
 ]
 
 [project.urls]
@@ -36,6 +40,11 @@ Issues = "https://github.com/Influencers-Club/influencers-club-mcp/issues"
 
 [project.scripts]
 influencers-club-mcp = "influencers_club_mcp:main"
+
+# Development-only groups (PEP 735); not part of the published package.
+# Install with: pip install -e . --group test
+[dependency-groups]
+test = ["pytest"]
 
 [build-system]
 requires = ["setuptools>=75.0"]

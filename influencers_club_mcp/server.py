@@ -6,7 +6,9 @@ discovery, batch operations, content data, and account management.
 """
 
 import asyncio
+import importlib.metadata
 import json
+import logging
 import os
 import re
 import time as _time
@@ -14,14 +16,19 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated, Any, Optional
 
+from mcp.server.auth.middleware.bearer_auth import AuthenticatedUser
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.server import TransportSecuritySettings
 from mcp.server.lowlevel.server import request_ctx
 from pydantic import Field
 
-from .api_client import ApiError, InfluencersApiClient, _log, _sanitize
+from .api_client import ApiError, InfluencersApiClient, _sanitize
+from .auth import IntrospectionUnavailableMiddleware
 from .csv_export import creators_to_csv
 from .discovery_filters import DiscoveryFilters, coerce_filters
+from .log_config import configure_logging
+
+logger = logging.getLogger(__name__)
 
 # ─── Constants ─────────────────────────────────────────────────────────
 API_V1 = "/public/v1"
@@ -84,6 +91,10 @@ CREDIT_COSTS = {
 }
 
 # ─── Initialize ────────────────────────────────────────────────────────
+# Logging first: build_auth() below already logs, and FastMCP() only installs
+# its own line-wrapping handler while the root logger is still unconfigured.
+LOG_LEVEL = configure_logging()
+
 # Hosted (HTTP) mode is on whenever MCP_TRANSPORT selects an HTTP transport.
 # Used to (a) configure DNS-rebinding/Origin protection, (b) gate localhost-only
 # tools that don't make sense on shared infra.
@@ -112,6 +123,22 @@ if HTTP_MODE:
     _mcp_kwargs["host"] = os.environ.get("MCP_HOST", "0.0.0.0")
     _mcp_kwargs["port"] = int(os.environ.get("MCP_PORT", "8000"))
     _mcp_kwargs["streamable_http_path"] = os.environ.get("MCP_PATH", "/mcp")
+    # A throwaway transport and session per request, no Mcp-Session-Id. A stateful
+    # session lives in one process's memory, and the hosted server sits behind a
+    # load balancer with no stickiness: a request landing on another instance is a
+    # 404 "Session not found", and every deploy drops every session. Nothing here
+    # needs a session: no tool pushes progress, elicitation or sampling to the
+    # client. What it costs: a client's notifications/cancelled lands in its own
+    # throwaway session, so an interrupted tool call still finishes its one
+    # upstream request; only the initialize request ever sees clientInfo (see
+    # _get_mcp_client_name); and the SDK enters FastMCP's lifespan per request,
+    # so this server must never be given one.
+    _mcp_kwargs["stateless_http"] = True
+    # The SDK tears each request's transport down afterwards and says so at INFO
+    # ("Terminating session: None"), once per request; that logger has nothing
+    # else to say at INFO. Left alone when debugging, where its DEBUG lines matter.
+    if LOG_LEVEL != "DEBUG":
+        logging.getLogger("mcp.server.streamable_http").setLevel(logging.WARNING)
 
     # OAuth 2.1 resource-server mode (opt-in via MCP_OAUTH_ENABLED). Validates
     # dashboard-issued access tokens; the SDK then auto-serves the protected-
@@ -152,11 +179,31 @@ _INSTRUCTIONS_STDIO_EXTRAS = (
     "The uploaded CSV needs a 'handle' or 'email' header.\n"
 )
 
-mcp = FastMCP(
+class _FastMCP(FastMCP):
+    """FastMCP whose HTTP app answers 503 while the dashboard cannot verify tokens.
+
+    The SDK builds its auth middleware inside streamable_http_app() and answers 401
+    to every verifier failure. IntrospectionUnavailableMiddleware has to sit outside
+    that stack, so it is added here, on the app the SDK hands back.
+    """
+
+    def streamable_http_app(self):
+        app = super().streamable_http_app()
+        if self._token_verifier is not None:
+            app.add_middleware(IntrospectionUnavailableMiddleware)
+        return app
+
+
+mcp = _FastMCP(
     "influencers-club",
     instructions=_INSTRUCTIONS_CORE + ("" if HTTP_MODE else _INSTRUCTIONS_STDIO_EXTRAS),
+    log_level=LOG_LEVEL,
     **_mcp_kwargs,
 )
+# Stateless mode rebuilds the initialize options per request, and without a
+# version the SDK reads mcp's package metadata from disk each time. Pin it once;
+# the advertised serverInfo.version is the same value the SDK would look up.
+mcp._mcp_server.version = importlib.metadata.version("mcp")
 
 # Unauthenticated health probe for the ALB target group. See issue #13.
 if HTTP_MODE:
@@ -240,9 +287,12 @@ if HTTP_MODE:
             # credentials. The REQUEST body is never logged — it carries the refresh
             # token, the auth code and the PKCE verifier.
             grant = re.search(rb"grant_type=([A-Za-z0-9_.:%-]+)", body)
-            _log(
-                f"oauth-proxy {path} grant={grant.group(1).decode() if grant else '?'} "
-                f"-> {r.status_code}: {_sanitize(r.text[:300])}"
+            logger.warning(
+                "oauth-proxy %s grant=%s -> %s: %s",
+                path,
+                grant.group(1).decode() if grant else "?",
+                r.status_code,
+                _sanitize(r.text[:300]),
             )
         return Response(
             content=r.content,
@@ -258,7 +308,30 @@ if HTTP_MODE:
     async def oauth_register(request: Request) -> Response:
         return await _proxy_post(request, "/public/v1/oauth/register/")
 
-client = InfluencersApiClient()
+
+def _request_token() -> str | None:
+    """The bearer token verified for the HTTP request that carried the current message.
+
+    Not get_access_token(): that reads a contextvar, and in stateful streamable HTTP
+    every message of a session is handled in a task started during the session's
+    initialize request, so it keeps returning the token the session was opened with
+    even after the client has rotated it. The SDK attaches each message's own HTTP
+    request to the request context, and the auth middleware leaves the user it
+    verified for that request in the request's scope.
+    """
+    ctx = request_ctx.get(None)  # None outside any message
+    user = ctx.request.scope.get("user") if ctx and ctx.request else None
+    if isinstance(user, AuthenticatedUser):
+        return user.access_token.token or None
+    return None
+
+
+# With OAuth on, every API call must use the token its own request was authenticated
+# with, so the client is handed the reader above and refuses a call without one
+# rather than fall back to the env key. The client itself knows nothing of the SDK.
+client = InfluencersApiClient(
+    request_token=_request_token if _token_verifier is not None else None
+)
 
 # Let the token verifier ask the API client whether a token is still exchangeable.
 # Wired here because the verifier is built before the client exists, and doing it
@@ -478,35 +551,16 @@ def _error_response(e: Exception) -> str:
 
 
 def _get_mcp_client_name() -> str:
-    """Return the MCP clientInfo.name for the current request, or empty string if unavailable."""
-    import sys
-    try:
-        ctx = request_ctx.get()
-        # Try multiple paths — MCP library versions differ in structure
-        name = ""
-        try:
-            name = ctx.session.client_params.clientInfo.name or ""
-        except AttributeError:
-            pass
-        if not name:
-            try:
-                name = ctx.session._client_params.clientInfo.name or ""
-            except AttributeError:
-                pass
-        if not name:
-            try:
-                cp = getattr(ctx.session, "client_params", None) or getattr(ctx.session, "_client_params", None)
-                if cp:
-                    ci = getattr(cp, "clientInfo", None) or getattr(cp, "client_info", None)
-                    if ci:
-                        name = getattr(ci, "name", "") or ""
-            except Exception:
-                pass
-        print(f"[IC-MCP] client_name detected: '{name}'", file=sys.stderr)
-        return name
-    except Exception as exc:
-        print(f"[IC-MCP] client_name detection failed: {type(exc).__name__}: {exc}", file=sys.stderr)
-        return ""
+    """The name the client gave at initialize, "" when the session never saw one.
+
+    Over stdio the session handled the client's initialize request. Over HTTP the
+    server is stateless (see the FastMCP kwargs above): every request gets a fresh
+    session that never saw an initialize, so this is always "" there, which callers
+    treat as the most restricted client.
+    """
+    ctx = request_ctx.get(None)  # None outside any message
+    params = ctx.session.client_params if ctx is not None else None
+    return params.clientInfo.name if params is not None else ""
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -1805,7 +1859,6 @@ async def _filtered_list_tools_handler(req: _mcp_types.ListToolsRequest):
         return result  # Claude Code sees everything
 
     # Non-Claude Code: filter batch tools from the result and cache
-    import sys
     tools_result = result.root  # ServerResult wraps ListToolsResult
     original_count = len(tools_result.tools)
     tools_result.tools = [t for t in tools_result.tools if t.name not in _BATCH_TOOLS]
@@ -1816,7 +1869,7 @@ async def _filtered_list_tools_handler(req: _mcp_types.ListToolsRequest):
         mcp._mcp_server._tool_cache.pop(name, None)
 
     if filtered_count:
-        print(f"[IC-MCP] Hidden {filtered_count} batch tools from client '{client}'", file=sys.stderr)
+        logger.debug("Hidden %s batch tools from client '%s'", filtered_count, client)
 
     return result
 
