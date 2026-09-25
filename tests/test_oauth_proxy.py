@@ -164,6 +164,7 @@ def test_hosted_routes_forward_the_filled_in_request():
         capture_output=True,
         text=True,
         errors="replace",
+        timeout=60,
     )
 
     assert result.returncode == 0, result.stderr
