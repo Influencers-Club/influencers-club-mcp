@@ -15,6 +15,7 @@ import time as _time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated, Any, Optional
+from urllib.parse import parse_qsl, urlencode
 
 from mcp.server.auth.middleware.bearer_auth import AuthenticatedUser
 from mcp.server.fastmcp import FastMCP
@@ -206,6 +207,71 @@ mcp = _FastMCP(
 # the advertised serverInfo.version is the same value the SDK would look up.
 mcp._mcp_server.version = importlib.metadata.version("mcp")
 
+
+# ─── OAuth proxy fallbacks ─────────────────────────────────────────────
+# /authorize and /register below forward a client's OAuth messages to the dashboard.
+# Two things some clients get wrong would each leave the user holding a token this
+# server cannot use, so the proxy fills them in and forwards everything else as sent.
+
+
+def _map_openid_scope(scope: str) -> str:
+    """``all`` when ``openid`` is among the requested scopes, otherwise ``scope`` as sent.
+
+    Some clients request ``openid`` by default. This server implements no OpenID
+    Connect, and the dashboard drops scopes it doesn't know, so such a client would
+    get a token with no scope, which every API call refuses. Only ``openid`` is
+    special: a request whose scopes are all unsupported is forwarded unchanged.
+    """
+    return "all" if "openid" in scope.split() else scope
+
+
+def _authorize_query(query: str, resource: str) -> str:
+    """The authorize query to forward, unchanged unless it lacks ``resource`` or asks for ``openid``.
+
+    The MCP authorization spec requires clients to send ``resource`` (RFC 8707). The
+    dashboard binds the token to it, and introspection reports only tokens bound to
+    this server as active, so without it every request made with the new token gets
+    a 401. A client reaches this endpoint through this server's own metadata, so this
+    server is the resource it wants; RFC 8707 section 2.1 lets an authorization server
+    apply such a default. A blank ``resource`` counts as missing.
+    """
+    params = parse_qsl(query, keep_blank_values=True)
+    has_resource = any(name == "resource" and value for name, value in params)
+    maps_scope = any(
+        name == "scope" and _map_openid_scope(value) != value for name, value in params
+    )
+    if has_resource and not maps_scope:
+        return query
+    params = [
+        (name, _map_openid_scope(value) if name == "scope" else value)
+        for name, value in params
+        if name != "resource" or value
+    ]
+    if not has_resource:
+        params.append(("resource", resource))
+    return urlencode(params)
+
+
+def _register_body(body: bytes) -> bytes:
+    """The client-registration request to forward, with ``openid`` mapped in its scope.
+
+    The dashboard caps a client's scopes at the scope it registered with, so a client
+    registered with ``openid`` could never be granted ``all``, whatever it later asks
+    for at /authorize. Anything other than a JSON object with a string ``scope`` is
+    forwarded as sent, for the dashboard to judge.
+    """
+    try:
+        data = json.loads(body)
+    except ValueError:
+        return body
+    if not isinstance(data, dict) or not isinstance(data.get("scope"), str):
+        return body
+    scope = _map_openid_scope(data["scope"])
+    if scope == data["scope"]:
+        return body
+    return json.dumps({**data, "scope": scope}).encode()
+
+
 # Unauthenticated health probe for the ALB target group. See issue #13.
 if HTTP_MODE:
     from starlette.requests import Request
@@ -268,14 +334,22 @@ if HTTP_MODE:
     @mcp.custom_route("/authorize", methods=["GET"])
     async def oauth_authorize(request: Request) -> RedirectResponse:
         # Browser-facing: hand off to the dashboard's real authorize endpoint,
-        # preserving client_id / PKCE / redirect_uri / state / resource.
+        # preserving client_id / PKCE / redirect_uri / state / resource, with the
+        # fallbacks in _authorize_query.
         target = f"{_DASH}/public/v1/oauth/authorize/"
-        if request.url.query:
-            target = f"{target}?{request.url.query}"
+        query = _authorize_query(request.url.query, _oauth.resource)
+        if query != request.url.query:
+            logger.info(
+                "oauth-proxy /authorize: filled in resource/scope for client_id=%s",
+                request.query_params.get("client_id", "?"),
+            )
+        if query:
+            target = f"{target}?{query}"
         return RedirectResponse(url=target, status_code=302)
 
-    async def _proxy_post(request: Request, path: str) -> Response:
-        body = await request.body()
+    async def _proxy_post(request: Request, path: str, body: bytes | None = None) -> Response:
+        if body is None:
+            body = await request.body()
         ct = request.headers.get("content-type", "application/x-www-form-urlencoded")
         async with httpx.AsyncClient(timeout=30.0) as http:
             r = await http.post(f"{_DASH}{path}", content=body, headers={"Content-Type": ct})
@@ -307,7 +381,11 @@ if HTTP_MODE:
 
     @mcp.custom_route("/register", methods=["POST"])
     async def oauth_register(request: Request) -> Response:
-        return await _proxy_post(request, "/public/v1/oauth/register/")
+        sent = await request.body()
+        body = _register_body(sent)
+        if body != sent:
+            logger.info("oauth-proxy /register: mapped scope openid to all")
+        return await _proxy_post(request, "/public/v1/oauth/register/", body)
 
 
 def _request_token() -> str | None:
