@@ -25,6 +25,7 @@ from pydantic import Field
 from .api_client import ApiError, InfluencersApiClient, _sanitize
 from .auth import IntrospectionUnavailableMiddleware
 from .csv_export import creators_to_csv
+from .csv_import import count_csv_rows, mostly_emails, to_single_column
 from .discovery_filters import DiscoveryFilters, coerce_filters
 from .log_config import configure_logging
 
@@ -1112,8 +1113,7 @@ async def create_batch_enrichment(
                         # Scan first few data values
                         data_lines = [l.strip() for l in peek_text.strip().split("\n")[1:6] if l.strip()]
                         vals = [l.split(",")[0].strip().replace('"', '') for l in data_lines]
-                        email_ct = sum(1 for v in vals if "@" in v and "." in v.split("@")[-1])
-                        detected_input = "email" if vals and email_ct > len(vals) / 2 else "handle"
+                        detected_input = "email" if mostly_emails(vals) else "handle"
             except Exception:
                 pass  # fall back to showing all options
 
@@ -1210,58 +1210,8 @@ async def create_batch_enrichment(
                     )
 
                 # Ensure proper single-column CSV with handle/email header
-                # Check if first line is a valid header
-                valid_headers = ("email", "handle", "emails", "handles")
-                first_line = lines[0].strip().lower().replace('"', '').replace("'", "")
-
-                # Multi-column detection: extract the right column
-                if "," in lines[0]:
-                    import csv as _csv
-                    import io as _io
-                    header_cols = [c.strip().lower().replace('"', '').replace("'", "") for c in lines[0].split(",")]
-                    best_col = 0
-                    col_type = "handle"
-                    # Find column by header name
-                    for i, col_name in enumerate(header_cols):
-                        if col_name in valid_headers:
-                            best_col = i
-                            col_type = "email" if col_name in ("email", "emails") else "handle"
-                            break
-                    else:
-                        # No valid header — scan data for emails
-                        for ci in range(len(header_cols)):
-                            vals = []
-                            for row in lines[1:6]:
-                                cols = row.split(",")
-                                if ci < len(cols):
-                                    v = cols[ci].strip().replace('"', '')
-                                    if v:
-                                        vals.append(v)
-                            if vals and sum(1 for v in vals if "@" in v and "." in v.split("@")[-1]) > len(vals) / 2:
-                                best_col = ci
-                                col_type = "email"
-                                break
-
-                    # Extract single column
-                    reader = _csv.reader(_io.StringIO("\n".join(lines)))
-                    new_lines = [col_type]
-                    for i, row in enumerate(reader):
-                        if i == 0:
-                            continue
-                        if best_col < len(row):
-                            val = row[best_col].strip()
-                            if val:
-                                new_lines.append(val)
-                    lines = new_lines
-
-                elif first_line not in valid_headers:
-                    # Single column but no valid header — detect type and prepend header
-                    sample = lines[:5] if first_line not in valid_headers else lines[1:6]
-                    email_count = sum(1 for v in sample if "@" in v and "." in v.split("@")[-1])
-                    col_type = "email" if email_count > len(sample) / 2 else "handle"
-                    lines.insert(0, col_type)
-
-                csv_content = "\n".join(lines)
+                fixed = to_single_column(lines, first_line_is_header=False)
+                csv_content = "\n".join(fixed[0] if fixed else lines)
                 csv_bytes = csv_content.encode("utf-8")
             else:
                 raise ValueError("Provide csv_file_path or csv_content.")
@@ -1680,9 +1630,7 @@ async def wait_for_upload() -> str:
 
                     # Count rows
                     try:
-                        text = f.read_text(encoding="utf-8", errors="replace")
-                        lines = [l for l in text.strip().split("\n") if l.strip()]
-                        row_count = max(0, len(lines) - 1)
+                        row_count = count_csv_rows(f.read_text(encoding="utf-8", errors="replace"))
                     except Exception:
                         row_count = 0
 
