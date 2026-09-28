@@ -22,7 +22,7 @@ from mcp.server.fastmcp.server import TransportSecuritySettings
 from mcp.server.lowlevel.server import request_ctx
 from pydantic import Field
 
-from .api_client import ApiError, InfluencersApiClient, _sanitize
+from .api_client import ApiError, InfluencersApiClient
 from .auth import IntrospectionUnavailableMiddleware
 from .csv_export import creators_to_csv
 from .csv_import import count_csv_rows, mostly_emails, to_single_column
@@ -245,14 +245,14 @@ if HTTP_MODE:
     # serve the AS metadata advertising this host's own endpoints, then redirect/
     # proxy those to the dashboard (the real AS, reached the same way auth.py's
     # introspection already reaches it). The dashboard runs consent and mints +
-    # validates every token; the MCP only forwards the OAuth protocol messages
-    # (no token passthrough), so it stays a plain resource server.
-    import httpx
-
+    # validates every token; the MCP forwards the OAuth protocol messages, filling in
+    # what some clients leave out (see oauth_proxy.py), and never passes a token
+    # through, so it stays a plain resource server.
     from urllib.parse import urlsplit as _urlsplit
     from starlette.responses import RedirectResponse, Response
 
     from .oauth_config import load_oauth_config as _load_oauth_config
+    from .oauth_proxy import authorize_query, proxy_post, register_body
 
     _oauth = _load_oauth_config()
     _DASH = _oauth.api_base.rstrip("/")
@@ -282,46 +282,30 @@ if HTTP_MODE:
     @mcp.custom_route("/authorize", methods=["GET"])
     async def oauth_authorize(request: Request) -> RedirectResponse:
         # Browser-facing: hand off to the dashboard's real authorize endpoint,
-        # preserving client_id / PKCE / redirect_uri / state / resource.
+        # preserving client_id / PKCE / redirect_uri / state / resource, with the
+        # fallbacks in authorize_query.
         target = f"{_DASH}/public/v1/oauth/authorize/"
-        if request.url.query:
-            target = f"{target}?{request.url.query}"
-        return RedirectResponse(url=target, status_code=302)
-
-    async def _proxy_post(request: Request, path: str) -> Response:
-        body = await request.body()
-        ct = request.headers.get("content-type", "application/x-www-form-urlencoded")
-        async with httpx.AsyncClient(timeout=30.0) as http:
-            r = await http.post(f"{_DASH}{path}", content=body, headers={"Content-Type": ct})
-        if 400 <= r.status_code < 500:
-            # Claude's own grants come through here, and a rejection is returned to it
-            # verbatim with no record of why — the dashboard signals invalid_grant vs
-            # invalid_scope vs invalid_request only in the body, all as 400. Log the
-            # grant type and that body so a failed refresh is diagnosable.
-            # 4xx only: a 5xx on a DEBUG=True env renders a traceback whose locals hold
-            # credentials. The REQUEST body is never logged — it carries the refresh
-            # token, the auth code and the PKCE verifier.
-            grant = re.search(rb"grant_type=([A-Za-z0-9_.:%-]+)", body)
-            logger.warning(
-                "oauth-proxy %s grant=%s -> %s: %s",
-                path,
-                grant.group(1).decode() if grant else "?",
-                r.status_code,
-                _sanitize(r.text[:300]),
+        query = authorize_query(request.url.query, _oauth.resource)
+        if query != request.url.query:
+            logger.info(
+                "oauth-proxy /authorize: filled in resource/scope for client_id=%s",
+                request.query_params.get("client_id", "?"),
             )
-        return Response(
-            content=r.content,
-            status_code=r.status_code,
-            media_type=r.headers.get("content-type", "application/json"),
-        )
+        if query:
+            target = f"{target}?{query}"
+        return RedirectResponse(url=target, status_code=302)
 
     @mcp.custom_route("/token", methods=["POST"])
     async def oauth_token(request: Request) -> Response:
-        return await _proxy_post(request, "/public/v1/oauth/token/")
+        return await proxy_post(request, _DASH, "/public/v1/oauth/token/")
 
     @mcp.custom_route("/register", methods=["POST"])
     async def oauth_register(request: Request) -> Response:
-        return await _proxy_post(request, "/public/v1/oauth/register/")
+        sent = await request.body()
+        body = register_body(sent)
+        if body != sent:
+            logger.info("oauth-proxy /register: mapped scope openid to all")
+        return await proxy_post(request, _DASH, "/public/v1/oauth/register/", body)
 
 
 def _request_token() -> str | None:
