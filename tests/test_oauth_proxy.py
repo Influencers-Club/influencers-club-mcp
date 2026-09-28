@@ -18,7 +18,7 @@ from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
-from influencers_club_mcp.server import _authorize_query, _map_openid_scope, _register_body
+from influencers_club_mcp.oauth_proxy import authorize_query, map_openid_scope, register_body
 
 RESOURCE = "https://mcp.test/mcp"
 DASHBOARD = "https://dash.test"
@@ -44,7 +44,7 @@ BASE_QUERY = (
     ],
 )
 def test_only_a_request_with_openid_becomes_all(scope, forwarded):
-    assert _map_openid_scope(scope) == forwarded
+    assert map_openid_scope(scope) == forwarded
 
 
 @pytest.mark.parametrize(
@@ -60,11 +60,11 @@ def test_only_a_request_with_openid_becomes_all(scope, forwarded):
     ids=["resource-and-scope", "resource-no-scope", "other-resource", "unsupported-scopes"],
 )
 def test_a_compliant_authorize_request_is_forwarded_byte_for_byte(query):
-    assert _authorize_query(query, RESOURCE) == query
+    assert authorize_query(query, RESOURCE) == query
 
 
 def test_a_missing_resource_defaults_to_this_server():
-    forwarded = parse_qs(_authorize_query(f"{BASE_QUERY}&scope=all", RESOURCE))
+    forwarded = parse_qs(authorize_query(f"{BASE_QUERY}&scope=all", RESOURCE))
 
     assert forwarded["resource"] == [RESOURCE]
     assert {k: v for k, v in forwarded.items() if k != "resource"} == parse_qs(
@@ -74,7 +74,7 @@ def test_a_missing_resource_defaults_to_this_server():
 
 def test_a_blank_resource_counts_as_missing():
     forwarded = parse_qs(
-        _authorize_query(f"{BASE_QUERY}&resource=", RESOURCE), keep_blank_values=True
+        authorize_query(f"{BASE_QUERY}&resource=", RESOURCE), keep_blank_values=True
     )
 
     assert forwarded["resource"] == [RESOURCE]
@@ -83,7 +83,7 @@ def test_a_blank_resource_counts_as_missing():
 def test_openid_is_mapped_and_the_clients_resource_kept():
     query = f"{BASE_QUERY}&resource=https%3A%2F%2Fother.test&scope=openid"
 
-    forwarded = parse_qs(_authorize_query(query, RESOURCE))
+    forwarded = parse_qs(authorize_query(query, RESOURCE))
 
     assert forwarded["scope"] == ["all"]
     assert forwarded["resource"] == ["https://other.test"]
@@ -92,7 +92,7 @@ def test_openid_is_mapped_and_the_clients_resource_kept():
 def test_register_maps_openid_and_keeps_the_rest():
     sent = {"client_name": "Client", "redirect_uris": ["https://client.test/cb"], "scope": "openid"}
 
-    forwarded = json.loads(_register_body(json.dumps(sent).encode()))
+    forwarded = json.loads(register_body(json.dumps(sent).encode()))
 
     assert forwarded == {**sent, "scope": "all"}
 
@@ -111,7 +111,7 @@ def test_register_maps_openid_and_keeps_the_rest():
     ids=["no-scope", "all", "unsupported-scopes", "non-string-scope", "not-an-object", "not-json", "empty"],
 )
 def test_register_forwards_other_bodies_as_sent(body):
-    assert _register_body(body) == body
+    assert register_body(body) == body
 
 
 def test_hosted_routes_forward_the_filled_in_request():
