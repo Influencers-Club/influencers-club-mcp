@@ -1068,8 +1068,6 @@ async def create_batch_enrichment(
     email_required: Annotated[Optional[str], Field(description="For handle modes only: must_have or preferred")] = None,
     include_lookalikes: Annotated[Optional[bool], Field(description="For handle full mode only")] = None,
     include_audience_data: Annotated[Optional[bool], Field(description="For handle full mode, IG/TT/YT only")] = None,
-    exclude_platforms: Annotated[Optional[str], Field(description="For email-based (basic) mode only: a single platform to exclude from matches. One of: instagram, youtube, tiktok, twitter, twitch, onlyfans")] = None,
-    min_followers: Annotated[Optional[int], Field(description="For email-based modes only", ge=0)] = None,
     metadata: Annotated[Optional[Any], Field(description="Optional JSON metadata string (e.g., campaign name)")] = None,
 ) -> str:
     """Create a batch enrichment job. Upload a CSV with up to 10,000 handles or emails.
@@ -1118,7 +1116,7 @@ async def create_batch_enrichment(
                 pass  # fall back to showing all options
 
             email_options = [
-                {"mode": "basic", "input": "emails", "cost": "0.05 credits/record", "description": "Creator match with basic social stats. Optional: exclude_platforms, min_followers."},
+                {"mode": "basic", "input": "emails", "cost": "0.05 credits/record", "description": "Creator match with basic social stats."},
             ]
             handle_options = [
                 {"mode": "raw", "input": "handles", "cost": "0.03 credits/record", "description": "Basic profile info (bio, followers, verified). Requires platform."},
@@ -1141,8 +1139,7 @@ async def create_batch_enrichment(
                 "detected_input_type": detected_input,
                 "message": (
                     f"{hint} Ask the user which enrichment mode they want. Present these options. "
-                    "Only ask for the mode. Do NOT proactively ask about exclude_platforms or min_followers "
-                    "unless the user mentions wanting to filter."
+                    "Only ask for the mode."
                 ),
                 "options": options,
             }, indent=2)
@@ -1294,10 +1291,6 @@ async def create_batch_enrichment(
             data["include_lookalikes"] = str(include_lookalikes).lower()
         if include_audience_data is not None:
             data["include_audience_data"] = str(include_audience_data).lower()
-        if exclude_platforms:
-            data["exclude_platforms"] = _validate_platform(exclude_platforms, ENRICHMENT_PLATFORMS)
-        if min_followers is not None:
-            data["min_followers"] = str(min_followers)
         if metadata:
             data["metadata"] = json.dumps(metadata) if isinstance(metadata, dict) else str(metadata)
 
