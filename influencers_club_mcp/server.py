@@ -84,6 +84,20 @@ SOCIAL_PLATFORMS = (
 ENRICH_FULL_PLATFORMS = tuple(p for p in SOCIAL_PLATFORMS if p != "linkedin")
 VALID_SORT_BY = ("relevancy", "engagement_rate", "number_of_followers", "growth_rate")
 
+# Rejected rather than silently ignored: neither ever filtered anything, so
+# clients were charged for the matches they asked to leave out.
+BATCH_ENRICHMENT_UNSUPPORTED_FIELDS = {
+    "min_followers": (
+        "Not supported on batch enrichment. Each result carries a "
+        "'followers' count to filter on; to search by follower count use "
+        "'number_of_followers' with the discovery search tool instead."
+    ),
+    "exclude_platforms": (
+        "Not supported on batch enrichment. Email enrichment returns only "
+        "the platform with the highest follower count."
+    ),
+}
+
 CREDIT_COSTS = {
     "discovery": 0.01, "similar": 0.01, "overlap": 1, "socials": 0.5,
     "handle_raw": 0.03, "handle_full": 1, "email_basic": 0.05,
@@ -1069,6 +1083,8 @@ async def create_batch_enrichment(
     include_lookalikes: Annotated[Optional[bool], Field(description="For handle full mode only")] = None,
     include_audience_data: Annotated[Optional[bool], Field(description="For handle full mode, IG/TT/YT only")] = None,
     metadata: Annotated[Optional[Any], Field(description="Optional JSON metadata string (e.g., campaign name)")] = None,
+    exclude_platforms: Annotated[Optional[Any], Field(description="Not supported — do not pass. Rejected with an error explaining why.")] = None,
+    min_followers: Annotated[Optional[Any], Field(description="Not supported — do not pass. Rejected with an error explaining why.")] = None,
 ) -> str:
     """Create a batch enrichment job. Upload a CSV with up to 10,000 handles or emails.
 
@@ -1083,6 +1099,10 @@ async def create_batch_enrichment(
     try:
         if "claude-code" not in _get_mcp_client_name().lower():
             return _claude_code_error("create_batch_enrichment")
+        if exclude_platforms is not None:
+            raise ValueError(BATCH_ENRICHMENT_UNSUPPORTED_FIELDS["exclude_platforms"])
+        if min_followers is not None:
+            raise ValueError(BATCH_ENRICHMENT_UNSUPPORTED_FIELDS["min_followers"])
         if not enrichment_mode or enrichment_mode not in ("raw", "full", "basic"):
             # Detect input type from CSV header to show only relevant modes
             detected_input = None
