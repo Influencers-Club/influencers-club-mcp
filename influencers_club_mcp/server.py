@@ -1035,6 +1035,10 @@ _DETAIL_DOC = (
     '"full": the same with nothing trimmed. "raw": the API response as it came, several times larger '
     "(with `notes` only when a named section holds nothing)."
 )
+_PROFILE_DETAIL_DOC = (
+    '"compact": image links left out and other links cut to the first 30; `notes` lists each cut. '
+    '"full": the same with every link. "raw": the API response as it came.'
+)
 _RESULT_STEER = (
     "Returns every section by default, compacted to fit a model's context; `sections` leaves out parts "
     "the question doesn't need. Every call is billed in full. "
@@ -1103,7 +1107,6 @@ async def enrich_by_handle(
         "Enrich ONE creator by handle — who they are and how to reach them: validated email, name, gender, "
         "location, links to their accounts on other platforms, and vetting fields (verified, account type, "
         "follower and post counts, bio, niche). Costs 0.2 credits. Works on every supported platform. "
-        "Image links are left out and other links beyond the first 30 are cut, as `notes` says. "
         "Carries no audience or performance data — that is enrich_by_handle_analytics (0.8 credits)."
     ),
 )
@@ -1111,6 +1114,7 @@ async def enrich_by_handle_profile(
     handle: Annotated[str, Field(description="Creator's username, profile URL, or YouTube channel ID")],
     platform: Annotated[str, Field(description="Primary platform of the creator")],
     email_required: Annotated[str, Field(description='"must_have" returns only if a valid email is found (and costs nothing when none is); "preferred" returns data either way')] = "preferred",
+    detail: Annotated[Detail, BeforeValidator(_compact_when_null), Field(description=_PROFILE_DETAIL_DOC)] = "compact",
 ) -> str:
     """Enrich ONE creator by handle (identity and contact tier, 0.2 cr). Client-facing description is
     set on the decorator."""
@@ -1119,6 +1123,7 @@ async def enrich_by_handle_profile(
         handle = _validate_handle(handle)
         if email_required not in ("must_have", "preferred"):
             raise ValueError("email_required must be 'must_have' or 'preferred'")
+        detail = validate_detail(detail)
 
         result = await client.post(f"{API_V1}/creators/enrich/handle/profile/", {
             "handle": handle,
@@ -1126,7 +1131,7 @@ async def enrich_by_handle_profile(
             "email_required": email_required,
         })
         # Small, but half of it is two copies of the profile-picture link.
-        return _dump_json(shape_profile(result))
+        return _dump_json(shape_profile(result, detail))
     except Exception as e:
         return _error_response(e)
 

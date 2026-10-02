@@ -77,7 +77,8 @@ def response() -> dict:
                 "posting_frequency_recent_months": 4.670000076293945,
                 "income": {"min": 100, "max": 200, "currency": "USD"},
                 "tagged": [{"username": "friend", "userid": "1"}],
-                "brand_affinity": [{"name": "Brand 1", "interest": ["Music"]}],
+                # The API derives this list from the followers' audience_brand_affinity below.
+                "brand_affinity": [{"name": f"Brand {i}", "interest": ["Music", "Electronics"]} for i in range(40)],
                 "audience": {
                     "audience_followers": {
                         "success": True,
@@ -161,8 +162,20 @@ def test_the_creator_level_brand_list_stays_when_it_is_the_only_one():
     failed["result"]["instagram"]["audience"]["audience_followers"] = {"success": False, "error": "empty_audience"}
 
     out = shape_result(failed, list(ENRICH_SECTIONS), ENRICH_SECTIONS, "compact")
-    assert out["result"]["instagram"]["brand_affinity"] == [{"name": "Brand 1", "interest": ["Music"]}]
+    brands = out["result"]["instagram"]["brand_affinity"]
+    assert brands["columns"] == ["name", "interest"] and len(brands["rows"]) == 40
     assert not any("brand_affinity left out" in n for n in out["notes"])
+
+
+def test_the_creator_level_brand_list_stays_when_it_differs_from_the_followers():
+    """Only an exact repeat of the followers' brands is left out; anything else is data."""
+    differs = response()
+    differs["result"]["instagram"]["brand_affinity"][1]["interest"] = ["Music"]
+
+    for detail in ("compact", "full"):
+        out = shape_result(differs, list(ENRICH_SECTIONS), ENRICH_SECTIONS, detail)
+        assert out["result"]["instagram"]["brand_affinity"]["rows"][1] == ["Brand 1", ["Music"]]
+        assert not any("brand_affinity left out" in n for n in out["notes"])
 
 
 def test_counts_stay_exact_and_only_decimals_are_rounded():
@@ -348,6 +361,12 @@ def test_a_narrowed_result_says_which_parts_held_nothing():
     # The same on the raw level, which otherwise carries no notes.
     raw = shape_result(twitch, ["audience"], ENRICH_ANALYTICS_SECTIONS, "raw")
     assert raw == {"result": {}, "credits_cost": 0.8, "notes": ["audience: no data for this creator."]}
+
+    # A section that came back as an empty list holds nothing either.
+    listed = {"result": {"twitch": {"avg_views": 10.0, "sponsored_posts": []}, "lookalikes": []}, "credits_cost": 0.8}
+    out = shape_result(listed, ["sponsored_posts", "lookalikes"], ENRICH_ANALYTICS_SECTIONS, "compact")
+    assert out["result"] == {"twitch": {"sponsored_posts": []}, "lookalikes": []}
+    assert out["notes"][1:] == ["sponsored_posts, lookalikes: no data for this creator."]
 
     # Leaving the lookalikes out is not narrowing: nothing was asked for by name.
     without = validate_sections(None, ENRICH_ANALYTICS_SECTIONS, include_lookalikes=False)
@@ -624,6 +643,16 @@ def test_the_profile_tool_leaves_out_image_links(api):
         "other_links: the first 30 of 35 links.",
     ]
     assert api[0][0] == f"{server.API_V1}/creators/enrich/handle/profile/"
+
+
+def test_the_profile_tool_returns_every_link_on_request(api):
+    full = json.loads(asyncio.run(server.enrich_by_handle_profile(handle="creator", platform="instagram", detail="full")))
+    assert len(full["result"]["other_links"]) == LINK_LIMIT + 5
+    assert "profile_picture" not in json.dumps(full)
+    assert not any("other_links" in n for n in full["notes"])
+
+    raw = json.loads(asyncio.run(server.enrich_by_handle_profile(handle="creator", platform="instagram", detail="raw")))
+    assert raw == response()
 
 
 def test_the_full_tool_can_return_posts_alone(api):

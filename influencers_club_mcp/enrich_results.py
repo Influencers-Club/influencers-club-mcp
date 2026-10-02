@@ -302,13 +302,34 @@ def _graphql_nodes(value: dict) -> Optional[list]:
     return [e["node"] for e in edges]
 
 
-def _has_follower_brands(block: dict) -> bool:
-    """Whether a platform block carries its followers' brand affinity, which the
-    creator-level brand_affinity repeats without the weights."""
+def _brand_key(brand: Any) -> Any:
+    """A brand as its name and interest names, whichever of the two lists it comes from."""
+    if not isinstance(brand, dict):
+        return brand
+    interests = brand.get("interest") or []
+    return brand.get("name"), [i.get("name") if isinstance(i, dict) else i for i in interests]
+
+
+def _repeats_follower_brands(block: dict) -> bool:
+    """Whether a platform block's brand_affinity only repeats its followers'
+    audience_brand_affinity: the API derives it from that list, without the weights."""
+    brands = block.get("brand_affinity")
     audience = block.get("audience")
     followers = audience.get("audience_followers") if isinstance(audience, dict) else None
     data = followers.get("data") if isinstance(followers, dict) else None
-    return isinstance(data, dict) and bool(data.get("audience_brand_affinity"))
+    theirs = data.get("audience_brand_affinity") if isinstance(data, dict) else None
+    if not isinstance(brands, list) or not isinstance(theirs, list) or not brands:
+        return False
+    return [_brand_key(b) for b in brands] == [_brand_key(b) for b in theirs]
+
+
+def _holds_data(value: Any) -> bool:
+    """Whether anything is in there: an empty list or object, or a null, is nothing."""
+    if isinstance(value, dict):
+        return any(_holds_data(v) for v in value.values())
+    if isinstance(value, list):
+        return any(_holds_data(v) for v in value)
+    return value is not None
 
 
 def _repeats(value: Any, main: Any) -> bool:
@@ -365,7 +386,7 @@ class _Shaper:
     def result(self, result: dict) -> dict:
         out: dict[str, Any] = {}
         for key, value in result.items():
-            if isinstance(value, dict) and "brand_affinity" in value and _has_follower_brands(value):
+            if isinstance(value, dict) and _repeats_follower_brands(value):
                 self.notes.append(
                     f"{key}.brand_affinity left out: the same brands as the followers' "
                     "audience_brand_affinity, without the weights."
@@ -497,12 +518,14 @@ def _shaped(response: dict, result: dict, shaper: _Shaper, first_note: str, note
     return {**response, "result": shaped, "notes": [first_note, *shaper.notes, *notes]}
 
 
-def shape_profile(response: Any) -> Any:
-    """A profile-tier response compacted like the larger tiers, keeping the account's own ID."""
+def shape_profile(response: Any, detail: str = "compact") -> Any:
+    """A profile-tier response shaped like the larger tiers, keeping the account's own ID."""
+    detail = validate_detail(detail)
     result = response.get("result") if isinstance(response, dict) else None
-    if not isinstance(result, dict):
+    if not isinstance(result, dict) or detail == "raw":
         return response
-    return _shaped(response, result, _Shaper(trim=True, keep_account_id=True), _PROFILE_NOTE, [])
+    shaper = _Shaper(trim=detail == "compact", keep_account_id=True)
+    return _shaped(response, result, shaper, _PROFILE_NOTE, [])
 
 
 def shape_result(response: Any, sections: list[str], allowed: tuple[str, ...], detail: str) -> Any:
@@ -514,7 +537,7 @@ def shape_result(response: Any, sections: list[str], allowed: tuple[str, ...], d
     notes: list[str] = []
     # Naming sections is narrowing; switching the lookalikes off alone is not.
     if set(allowed) - set(sections) - {"lookalikes"}:
-        empty = [s for s in sections if not _select_sections(result, [s])]
+        empty = [s for s in sections if not _holds_data(_select_sections(result, [s]))]
         if empty:
             notes.append(f"{', '.join(empty)}: no data for this creator.")
     if len(sections) < len(allowed):
