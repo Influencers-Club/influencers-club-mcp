@@ -20,12 +20,23 @@ from mcp.server.auth.middleware.bearer_auth import AuthenticatedUser
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.server import TransportSecuritySettings
 from mcp.server.lowlevel.server import request_ctx
-from pydantic import Field
+from pydantic import BeforeValidator, Field
 
 from .api_client import ApiError, InfluencersApiClient, _sanitize
 from .auth import IntrospectionUnavailableMiddleware
 from .csv_export import creators_to_csv
 from .discovery_filters import DiscoveryFilters, coerce_filters
+from .enrich_results import (
+    ENRICH_ANALYTICS_SECTIONS,
+    ENRICH_SECTIONS,
+    AnalyticsSection,
+    Detail,
+    EnrichSection,
+    shape_profile,
+    shape_result,
+    validate_detail,
+    validate_sections,
+)
 from .log_config import configure_logging
 
 logger = logging.getLogger(__name__)
@@ -93,6 +104,12 @@ CREDIT_COSTS = {
     "handle_raw": 0.03, "handle_full": 1, "email_basic": 0.05,
     "posts": 0.15, "post_detail": 0.03,
 }
+
+# Claude Code parks a tool result over ~25k tokens in a file instead of showing
+# it to the model; a tool can raise its own ceiling to this hard maximum. The
+# compacted enrichment results reach ~21k tokens on the largest creators, and
+# detail="full" or "raw" go over 25k.
+_LARGE_RESULT_META = {"anthropic/maxResultSizeChars": 500_000}
 
 # ─── Initialize ────────────────────────────────────────────────────────
 # Logging first: build_auth() below already logs, and FastMCP() only installs
@@ -190,6 +207,13 @@ class _FastMCP(FastMCP):
     to every verifier failure. IntrospectionUnavailableMiddleware has to sit outside
     that stack, so it is added here, on the app the SDK hands back.
     """
+
+    def tool(self, *args, structured_output: bool | None = False, **kwargs):
+        # Every tool returns a JSON string. Left to infer, the SDK wraps it a second
+        # time as structuredContent {"result": text}, and Claude Code shows the model
+        # that form: the same JSON escaped inside a string (+12% characters, measured
+        # on an analytics result) and every result sent twice on the wire.
+        return super().tool(*args, structured_output=structured_output, **kwargs)
 
     def streamable_http_app(self):
         app = super().streamable_http_app()
@@ -422,6 +446,19 @@ def _validate_handle(handle: str) -> str:
         raise ValueError("Handle must be 1-200 characters")
     return h
 
+
+def _dump_json(obj: Any) -> str:
+    """Compact JSON with non-ASCII text as it is, so a large result spends its characters
+    on data rather than on indentation and escape sequences (escaped, a 120-character
+    caption in another script runs to 700)."""
+    text = json.dumps(obj, separators=(",", ":"), ensure_ascii=False)
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        # A lone UTF-16 surrogate in the API's text (a caption cut mid-emoji upstream)
+        # cannot travel as UTF-8; escaped JSON carries it, as every result used to go.
+        text = json.dumps(obj, separators=(",", ":"))
+    return text
 
 
 def _flatten(obj: Any, prefix: str = "") -> dict[str, str]:
@@ -970,6 +1007,40 @@ def _bulk_enrich_hint(items: str) -> str:
     return "" if HTTP_MODE else f" For bulk (more than ~10 {items}), use create_batch_enrichment."
 
 
+def _as_list(value: Any) -> Any:
+    """A bare section name becomes a one-item list, so the tool checks it rather than the schema refusing it."""
+    return [value] if isinstance(value, str) else value
+
+
+def _compact_when_null(value: Any) -> Any:
+    return "compact" if value is None else value
+
+
+_SECTIONS_DOC = (
+    "Parts of the report to return; default is every part. Name only what the question needs to "
+    "leave the rest out. overview: performance medians and hashtags; growth, income, posting frequency "
+    "and niche when available; "
+    "audience: demographics of followers and of engaged users (ages, genders, countries, cities, "
+    "languages, interests, credibility); audience_brands: brands the audience follows; "
+    "audience_notable_users: notable accounts among followers and engaged users; "
+    "audience_lookalikes: creators whose audience resembles this creator's; "
+    "sponsors: past sponsors and brands found in content; sponsored_posts: recent sponsored posts; "
+    "lookalikes: creators similar to this one."
+)
+_DETAIL_DOC = (
+    '"compact": media and profile links, internal IDs other than post IDs, and map coordinates left out, lists sent as '
+    "column/row tables, and the longest lists trimmed (top 30 audience brands, only verified accounts among "
+    "notable likers and commenters or the 10 largest when none is, captions cut to 120 characters, first 30 "
+    "other links); `notes` lists each cut. "
+    '"full": the same with nothing trimmed. "raw": the API response as it came, several times larger '
+    "(with `notes` only when a named section holds nothing)."
+)
+_RESULT_STEER = (
+    "Returns every section by default, compacted to fit a model's context; `sections` leaves out parts "
+    "the question doesn't need. Every call is billed in full. "
+)
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # 14. ENRICH BY HANDLE (FULL)
 # ═══════════════════════════════════════════════════════════════════════
@@ -979,20 +1050,26 @@ def _bulk_enrich_hint(items: str) -> str:
     description=(
         "Enrich ONE creator by handle (everything: email, demographics, audience, brand deals, recent posts, and an "
         "income estimate when the creator has one). "
-        "Costs 1 credit. "
+        "Costs 1 credit. " + _RESULT_STEER +
         "For half of it: enrich_by_handle_profile (identity and contact, 0.2 credits) or "
         "enrich_by_handle_analytics (performance and audience, 0.8 credits). Those two together also cost 1 credit, "
         "so this tool is the better call when both halves are wanted. For platform basics only (bio, follower "
         "and post counts, verification), enrich_by_handle_raw costs 0.03 credits."
         + _bulk_enrich_hint("handles")
     ),
+    meta=_LARGE_RESULT_META,
 )
 async def enrich_by_handle(
     handle: Annotated[str, Field(description="Creator's username, profile URL, or YouTube channel ID")],
     platform: Annotated[str, Field(description="Primary platform of the creator (NOT linkedin — for linkedin use enrich_by_handle_profile or enrich_by_handle_raw)")],
     email_required: Annotated[str, Field(description='"must_have" returns only if email found; "preferred" returns data even without email')] = "preferred",
-    include_lookalikes: Annotated[bool, Field(description="Include similar creator suggestions")] = False,
+    include_lookalikes: Annotated[Optional[bool], Field(description="Similar creators (the lookalikes section) come by default; false leaves them out")] = None,
     include_audience_data: Annotated[bool, Field(description="Include audience demographics (IG, TT, YT only)")] = True,
+    sections: Annotated[Optional[list[EnrichSection]], BeforeValidator(_as_list), Field(description=(
+        _SECTIONS_DOC + " On this tier overview also carries identity and contact fields, "
+        "and posts: recent posts with engagement."
+    ))] = None,
+    detail: Annotated[Detail, BeforeValidator(_compact_when_null), Field(description=_DETAIL_DOC)] = "compact",
 ) -> str:
     """Enrich ONE creator by handle (full data). Costs 1 credit. Client-facing description is set
     on the decorator so the bulk hint can be omitted in hosted mode (no create_batch_enrichment)."""
@@ -1001,15 +1078,17 @@ async def enrich_by_handle(
         handle = _validate_handle(handle)
         if email_required not in ("must_have", "preferred"):
             raise ValueError("email_required must be 'must_have' or 'preferred'")
+        sections = validate_sections(sections, ENRICH_SECTIONS, include_lookalikes)
+        detail = validate_detail(detail)
 
         result = await client.post(f"{API_V1}/creators/enrich/handle/full/", {
             "handle": handle,
             "platform": platform,
             "email_required": email_required,
-            "include_lookalikes": include_lookalikes,
+            "include_lookalikes": "lookalikes" in sections,
             "include_audience_data": include_audience_data,
         })
-        return json.dumps(result, indent=2)
+        return _dump_json(shape_result(result, sections, ENRICH_SECTIONS, detail))
     except Exception as e:
         return _error_response(e)
 
@@ -1024,6 +1103,7 @@ async def enrich_by_handle(
         "Enrich ONE creator by handle — who they are and how to reach them: validated email, name, gender, "
         "location, links to their accounts on other platforms, and vetting fields (verified, account type, "
         "follower and post counts, bio, niche). Costs 0.2 credits. Works on every supported platform. "
+        "Image links are left out and other links beyond the first 30 are cut, as `notes` says. "
         "Carries no audience or performance data — that is enrich_by_handle_analytics (0.8 credits)."
     ),
 )
@@ -1045,7 +1125,8 @@ async def enrich_by_handle_profile(
             "platform": platform,
             "email_required": email_required,
         })
-        return json.dumps(result, indent=2)
+        # Small, but half of it is two copies of the profile-picture link.
+        return _dump_json(shape_profile(result))
     except Exception as e:
         return _error_response(e)
 
@@ -1059,29 +1140,34 @@ async def enrich_by_handle_profile(
     description=(
         "Enrich ONE creator by handle — how they perform and who follows them: audience demographics and "
         "interests, engagement medians, brand affinity and past sponsors, plus follower growth, posting "
-        "frequency and an income estimate when the creator has them. Costs 0.8 credits. "
+        "frequency and an income estimate when the creator has them. Costs 0.8 credits. " + _RESULT_STEER +
         "Only instagram, youtube, tiktok, twitch, twitter and onlyfans have analytics data. "
         "Carries no email, identity, follower count or engagement rate — that is enrich_by_handle_profile "
         "(0.2 credits)."
     ),
+    meta=_LARGE_RESULT_META,
 )
 async def enrich_by_handle_analytics(
     handle: Annotated[str, Field(description="Creator's username, profile URL, or YouTube channel ID")],
     platform: Annotated[str, Field(description="Primary platform of the creator (analytics exists only for instagram, youtube, tiktok, twitch, twitter, onlyfans)")],
-    include_lookalikes: Annotated[bool, Field(description="Include similar creator suggestions")] = False,
+    include_lookalikes: Annotated[Optional[bool], Field(description="Similar creators (the lookalikes section) come by default; false leaves them out")] = None,
+    sections: Annotated[Optional[list[AnalyticsSection]], BeforeValidator(_as_list), Field(description=_SECTIONS_DOC)] = None,
+    detail: Annotated[Detail, BeforeValidator(_compact_when_null), Field(description=_DETAIL_DOC)] = "compact",
 ) -> str:
     """Enrich ONE creator by handle (performance and audience tier, 0.8 cr). Client-facing description is
     set on the decorator."""
     try:
         platform = _validate_platform(platform, ENRICH_ANALYTICS_PLATFORMS)
         handle = _validate_handle(handle)
+        sections = validate_sections(sections, ENRICH_ANALYTICS_SECTIONS, include_lookalikes)
+        detail = validate_detail(detail)
 
         result = await client.post(f"{API_V1}/creators/enrich/handle/analytics/", {
             "handle": handle,
             "platform": platform,
-            "include_lookalikes": include_lookalikes,
+            "include_lookalikes": "lookalikes" in sections,
         })
-        return json.dumps(result, indent=2)
+        return _dump_json(shape_result(result, sections, ENRICH_ANALYTICS_SECTIONS, detail))
     except Exception as e:
         return _error_response(e)
 
