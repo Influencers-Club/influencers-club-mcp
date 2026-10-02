@@ -82,6 +82,10 @@ SOCIAL_PLATFORMS = (
 )
 # Full enrichment intentionally steers linkedin to the cheaper raw endpoint.
 ENRICH_FULL_PLATFORMS = tuple(p for p in SOCIAL_PLATFORMS if p != "linkedin")
+# The analytics tier carries no data for the scraper-only platforms and rejects
+# them with a 400. Spelled out rather than aliased to DISCOVERY_PLATFORMS: the
+# members match today but the two answer different questions and would drift.
+ENRICH_ANALYTICS_PLATFORMS = ("instagram", "youtube", "tiktok", "twitch", "twitter", "onlyfans")
 VALID_SORT_BY = ("relevancy", "engagement_rate", "number_of_followers", "growth_rate")
 
 CREDIT_COSTS = {
@@ -973,15 +977,19 @@ def _bulk_enrich_hint(items: str) -> str:
     name="enrich_by_handle",
     annotations={"title": "Enrich by Handle (Full)", "readOnlyHint": True, "destructiveHint": False, "openWorldHint": True},
     description=(
-        "Enrich ONE creator by handle (full data: email, demographics, audience, income, brand deals). "
-        "Costs 1 credit."
+        "Enrich ONE creator by handle (everything: email, demographics, audience, brand deals, recent posts, and an "
+        "income estimate when the creator has one). "
+        "Costs 1 credit. "
+        "For half of it: enrich_by_handle_profile (identity and contact, 0.2 credits) or "
+        "enrich_by_handle_analytics (performance and audience, 0.8 credits). Those two together also cost 1 credit, "
+        "so this tool is the better call when both halves are wanted. For platform basics only (bio, follower "
+        "and post counts, verification), enrich_by_handle_raw costs 0.03 credits."
         + _bulk_enrich_hint("handles")
-        + " For basic profile data only, enrich_by_handle_raw returns a smaller result at 0.03 credits."
     ),
 )
 async def enrich_by_handle(
     handle: Annotated[str, Field(description="Creator's username, profile URL, or YouTube channel ID")],
-    platform: Annotated[str, Field(description="Primary platform of the creator (NOT linkedin — use enrich_by_handle_raw for linkedin)")],
+    platform: Annotated[str, Field(description="Primary platform of the creator (NOT linkedin — for linkedin use enrich_by_handle_profile or enrich_by_handle_raw)")],
     email_required: Annotated[str, Field(description='"must_have" returns only if email found; "preferred" returns data even without email')] = "preferred",
     include_lookalikes: Annotated[bool, Field(description="Include similar creator suggestions")] = False,
     include_audience_data: Annotated[bool, Field(description="Include audience demographics (IG, TT, YT only)")] = True,
@@ -1007,13 +1015,88 @@ async def enrich_by_handle(
 
 
 # ═══════════════════════════════════════════════════════════════════════
+# 14A. ENRICH BY HANDLE (PROFILE)
+# ═══════════════════════════════════════════════════════════════════════
+@mcp.tool(
+    name="enrich_by_handle_profile",
+    annotations={"title": "Enrich by Handle (Profile)", "readOnlyHint": True, "destructiveHint": False, "openWorldHint": True},
+    description=(
+        "Enrich ONE creator by handle — who they are and how to reach them: validated email, name, gender, "
+        "location, links to their accounts on other platforms, and vetting fields (verified, account type, "
+        "follower and post counts, bio, niche). Costs 0.2 credits. Works on every supported platform. "
+        "Carries no audience or performance data — that is enrich_by_handle_analytics (0.8 credits)."
+    ),
+)
+async def enrich_by_handle_profile(
+    handle: Annotated[str, Field(description="Creator's username, profile URL, or YouTube channel ID")],
+    platform: Annotated[str, Field(description="Primary platform of the creator")],
+    email_required: Annotated[str, Field(description='"must_have" returns only if a valid email is found (and costs nothing when none is); "preferred" returns data either way')] = "preferred",
+) -> str:
+    """Enrich ONE creator by handle (identity and contact tier, 0.2 cr). Client-facing description is
+    set on the decorator."""
+    try:
+        platform = _validate_platform(platform, SOCIAL_PLATFORMS)
+        handle = _validate_handle(handle)
+        if email_required not in ("must_have", "preferred"):
+            raise ValueError("email_required must be 'must_have' or 'preferred'")
+
+        result = await client.post(f"{API_V1}/creators/enrich/handle/profile/", {
+            "handle": handle,
+            "platform": platform,
+            "email_required": email_required,
+        })
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        return _error_response(e)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 14B. ENRICH BY HANDLE (ANALYTICS)
+# ═══════════════════════════════════════════════════════════════════════
+@mcp.tool(
+    name="enrich_by_handle_analytics",
+    annotations={"title": "Enrich by Handle (Analytics)", "readOnlyHint": True, "destructiveHint": False, "openWorldHint": True},
+    description=(
+        "Enrich ONE creator by handle — how they perform and who follows them: audience demographics and "
+        "interests, engagement medians, brand affinity and past sponsors, plus follower growth, posting "
+        "frequency and an income estimate when the creator has them. Costs 0.8 credits. "
+        "Only instagram, youtube, tiktok, twitch, twitter and onlyfans have analytics data. "
+        "Carries no email, identity, follower count or engagement rate — that is enrich_by_handle_profile "
+        "(0.2 credits)."
+    ),
+)
+async def enrich_by_handle_analytics(
+    handle: Annotated[str, Field(description="Creator's username, profile URL, or YouTube channel ID")],
+    platform: Annotated[str, Field(description="Primary platform of the creator (analytics exists only for instagram, youtube, tiktok, twitch, twitter, onlyfans)")],
+    include_lookalikes: Annotated[bool, Field(description="Include similar creator suggestions")] = False,
+) -> str:
+    """Enrich ONE creator by handle (performance and audience tier, 0.8 cr). Client-facing description is
+    set on the decorator."""
+    try:
+        platform = _validate_platform(platform, ENRICH_ANALYTICS_PLATFORMS)
+        handle = _validate_handle(handle)
+
+        result = await client.post(f"{API_V1}/creators/enrich/handle/analytics/", {
+            "handle": handle,
+            "platform": platform,
+            "include_lookalikes": include_lookalikes,
+        })
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        return _error_response(e)
+
+
+# ═══════════════════════════════════════════════════════════════════════
 # 15. ENRICH BY HANDLE (RAW)
 # ═══════════════════════════════════════════════════════════════════════
 @mcp.tool(
     name="enrich_by_handle_raw",
     annotations={"title": "Enrich by Handle (Raw)", "readOnlyHint": True, "destructiveHint": False, "openWorldHint": True},
     description=(
-        "Enrich ONE creator by handle (basic). Costs 0.03 credits. Supports linkedin."
+        "Enrich ONE creator by handle (platform basics as the source reports them: bio, follower and post "
+        "counts, verification, recent post data). Costs 0.03 credits — the cheapest tier. Supports linkedin. "
+        "Richer tiers: enrich_by_handle_profile (identity and contact, 0.2 credits), enrich_by_handle_analytics "
+        "(performance and audience, 0.8 credits), enrich_by_handle (everything, 1 credit)."
         + _bulk_enrich_hint("handles")
     ),
 )
@@ -1122,7 +1205,7 @@ async def create_batch_enrichment(
             ]
             handle_options = [
                 {"mode": "raw", "input": "handles", "cost": "0.03 credits/record", "description": "Basic profile info (bio, followers, verified). Requires platform."},
-                {"mode": "full", "input": "handles", "cost": "1 credit/record", "description": "Everything: email, demographics, audience, income, brand deals. Requires platform."},
+                {"mode": "full", "input": "handles", "cost": "1 credit/record", "description": "Everything: email, demographics, audience, brand deals, and an income estimate when the creator has one. Requires platform."},
             ]
 
             if detected_input == "email":
