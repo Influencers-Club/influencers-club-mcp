@@ -23,7 +23,7 @@ The hosted server runs at `https://mcp-dashboard.influencers.club/mcp` and signs
 **Requirements:** an [Influencers Club](https://influencers.club) account with API credits. Discovery and enrichment tools consume credits (costs are listed on every tool and in the tables below); dictionary/lookup tools are free.
 
 **Notes:**
-- The hosted connector exposes the 19 API tools. File and batch tools (CSV export, bulk CSV enrichment) need a local filesystem and are available only in the [local install](#local-install-stdio).
+- The hosted connector exposes the 21 API tools. File and batch tools (CSV export, bulk CSV enrichment) need a local filesystem and are available only in the [local install](#local-install-stdio).
 - **Connection expired / 401 errors:** disconnect and reconnect the connector to re-authenticate.
 - **"Insufficient credits" errors:** top up in the [dashboard](https://dashboard.influencers.club); calls keep failing until the balance is positive.
 
@@ -34,7 +34,7 @@ The same hosted server works as a ChatGPT connector:
 1. In ChatGPT, enable **Settings → Apps → Advanced settings → Developer mode** (available on Plus, Pro, Business, Enterprise, and Edu plans).
 2. Add a new connector with the URL: `https://mcp-dashboard.influencers.club/mcp`
 3. Click **Connect** — you'll be redirected to the Influencers Club dashboard to sign in and approve access.
-4. Done. The same 19 API tools are available; the credit requirements and notes from the claude.ai section apply unchanged.
+4. Done. The same 21 API tools are available; the credit requirements and notes from the claude.ai section apply unchanged.
 
 ## Local Install (stdio)
 
@@ -161,9 +161,9 @@ Add to your Claude Desktop `claude_desktop_config.json`:
 
 After configuring, restart your client. The server will appear as "influencers-club".
 
-## Available Tools (29)
+## Available Tools (31)
 
-19 API tools are available everywhere (hosted connector and local). Tools marked **local only** need the local filesystem, so they exist only in stdio installs.
+21 API tools are available everywhere (hosted connector and local). Tools marked **local only** need the local filesystem, so they exist only in stdio installs.
 
 ### Creator Discovery
 
@@ -178,10 +178,14 @@ After configuring, restart your client. The server will appear as "influencers-c
 
 | Tool | Description | Cost |
 |---|---|---|
-| `enrich_by_handle` | Full enriched profile: email, demographics, audience, income, brand deals | 1 credit |
-| `enrich_by_handle_raw` | Basic profile data: bio, followers, verification status | 0.03 credits |
+| `enrich_by_handle` | Everything below combined, plus recent posts | 1 credit |
+| `enrich_by_handle_analytics` | Audience demographics, engagement, brand affinity; growth and income when the creator has them | 0.8 credits |
+| `enrich_by_handle_profile` | Identity and contact: email, name, location, cross-platform links, vetting | 0.2 credits |
+| `enrich_by_handle_raw` | Platform basics: bio, followers, verification status, recent post data | 0.03 credits |
 | `enrich_by_email` | Find creator profiles from an email | 0.05 credits |
 | `connected_socials` | Discover all linked social accounts for a creator | 0.5 credits |
+
+`enrich_by_handle` and `enrich_by_handle_analytics` return every section of the report, compacted so it fits within the assistant's tool-result limit: image and profile links, internal IDs other than post IDs, and map coordinates are left out, lists come as column/row tables, and the longest lists are trimmed (top 30 audience brands, verified accounts only among notable likers and commenters or the 10 largest when none is verified, captions cut to 120 characters, the first 30 other links). The result's `notes` lists every cut. `detail="full"` keeps every entry, `detail="raw"` returns the API response as it came, and a `sections` list (`overview`, `audience`, `audience_brands`, `audience_notable_users`, `audience_lookalikes`, `sponsors`, `sponsored_posts`, `lookalikes`, and `posts` on the full tier) leaves out the parts a question doesn't need. `enrich_by_handle_profile` takes `detail` too: it leaves out image links and cuts other links to the first 30 unless `detail="full"`.
 
 ### Content Data
 
