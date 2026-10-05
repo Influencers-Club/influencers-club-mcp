@@ -427,6 +427,7 @@ def _validate_handle(handle: str) -> str:
 
 
 EXCLUSION_LISTS_PATH = f"{API_V1}/discovery/exclusion-lists/"
+_MAX_IDS_IN_ERROR = 10
 
 
 def _list_path(list_id: int) -> str:
@@ -483,13 +484,19 @@ async def _check_exclusion_lists(filters: dict, platform: str) -> None:
     by_id = {item["id"]: item for item in lists}
     unknown = sorted({i for i in ids if i not in by_id})
     wrong_platform = sorted({i for i in ids if i in by_id and by_id[i].get("platform") != platform})
+    def more(found: list) -> str:
+        # Name a few; a caller can send any number of ids.
+        extra = len(found) - _MAX_IDS_IN_ERROR
+        return f" and {extra} more" if extra > 0 else ""
+
     problems = []
     if unknown:
-        problems.append(f"not found in your team: {unknown}")
+        problems.append(f"not found in your team: {unknown[:_MAX_IDS_IN_ERROR]}{more(unknown)}")
     if wrong_platform:
         problems.append(
             f"not {platform} lists: "
-            + ", ".join(f"{i} ({by_id[i].get('platform')})" for i in wrong_platform)
+            + ", ".join(f"{i} ({by_id[i].get('platform')})" for i in wrong_platform[:_MAX_IDS_IN_ERROR])
+            + more(wrong_platform)
         )
     if problems:
         raise ValueError(

@@ -220,6 +220,18 @@ def test_discovery_refuses_list_ids_the_api_would_silently_ignore(api):
     assert [c[0] for c in fake.calls] == ["GET"]  # no search, no credits spent
 
 
+def test_the_refusal_names_only_the_first_few_bad_ids(api):
+    """exclude_list has no size limit, so the message must not grow with it."""
+    fake = api([{**TIKTOK, "id": i} for i in range(1, 501)])
+    ids = list(range(1, 501)) + list(range(1000, 6000))
+    result = run(server.discover_creators(platform="instagram", filters={"exclude_list": ids}))
+    message = result["message"]
+    assert "[1000, 1001, 1002, 1003, 1004, 1005, 1006, 1007, 1008, 1009] and 4990 more" in message
+    assert "10 (tiktok) and 490 more" in message and "11 (tiktok)" not in message
+    assert len(message) < 500
+    assert [c[0] for c in fake.calls] == ["GET"]
+
+
 def test_discovery_sends_the_exclusion_filters_once_the_ids_check_out(api):
     fake = api([LIST], SEARCH)
     filters = {"exclude_list": [42], "exclude_default_list": True}
