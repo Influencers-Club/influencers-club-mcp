@@ -167,7 +167,14 @@ _INSTRUCTIONS_CORE = (
     "Credits: every discovery/enrichment result costs credits (amounts are stated on each tool). "
     "The limit parameter controls spend — it defaults to the requested amount, max 50 per request.\n\n"
     "discover_creators: 'ai_search' does semantic niche/topic search and works best with the user's "
-    "own words. 'hashtags' and 'keywords_in_bio' are separate, literal filters.\n"
+    "own words. 'hashtags' and 'keywords_in_bio' are separate, literal filters.\n\n"
+    "Exclusion lists: team-shared, per-platform blocklists of creator handles (free, no credits). "
+    "Specific lists are addressed by id (list_exclusion_lists, create_exclusion_list, get_exclusion_list, "
+    "rename_exclusion_list, delete_exclusion_list, get_exclusion_list_handles, add_to_exclusion_list, "
+    "remove_from_exclusion_list); each platform also has one default list addressed by platform "
+    "(get_default_exclusion_list, get_default_exclusion_list_handles, add_to_default_exclusion_list, "
+    "remove_from_default_exclusion_list). A list only affects a search when the discover_creators or "
+    "find_similar_creators filters carry exclude_list (ids), exclude_default_list or exclude_all_lists.\n"
 )
 
 _INSTRUCTIONS_STDIO_EXTRAS = (
@@ -419,6 +426,79 @@ def _validate_handle(handle: str) -> str:
     return h
 
 
+EXCLUSION_LISTS_PATH = f"{API_V1}/discovery/exclusion-lists/"
+
+
+def _list_path(list_id: int) -> str:
+    """Route of a specific exclusion list: ``/exclusion-lists/{list_id}/``."""
+    return f"{EXCLUSION_LISTS_PATH}{list_id}/"
+
+
+def _default_list_path(platform: str) -> str:
+    """Route of a platform's default exclusion list: ``/exclusion-lists/default/{platform}/``."""
+    return f"{EXCLUSION_LISTS_PATH}default/{_validate_platform(platform, DISCOVERY_PLATFORMS)}/"
+
+
+def _validate_handles(handles: list[str]) -> list[str]:
+    """Strip and drop blank entries. No length cap: an entry may be a full profile URL,
+    and the API lowercases, strips '@' and reduces URLs to the handle itself."""
+    cleaned = [h.strip() for h in handles if h and h.strip()]
+    if not cleaned:
+        raise ValueError("handles must contain at least one non-empty handle")
+    return cleaned
+
+
+def _validate_list_name(name: str) -> str:
+    """Strip an exclusion-list name and reject a blank one."""
+    name = name.strip()
+    if not name:
+        raise ValueError("name must not be blank")
+    return name
+
+
+async def _check_exclusion_lists(filters: dict, platform: str) -> None:
+    """Fail before a search when filters.exclude_list names lists that would not apply.
+
+    The API drops ids that are not the team's or not for the searched platform without
+    an error — it notes them only in response_meta, which the public response strips —
+    so the search would run unfiltered and still cost credits. One free GET of the
+    team's lists catches that first. When that lookup itself fails the search is not
+    run either: unverified ids could mean paying for unfiltered results.
+    """
+    ids = filters.get("exclude_list") or []
+    # With exclude_all_lists the API applies every list for the platform, whatever the ids say.
+    if not ids or filters.get("exclude_all_lists"):
+        return
+    try:
+        lists = await client.get(EXCLUSION_LISTS_PATH)
+    except ApiError as e:
+        logger.warning("exclude_list not verified, search not run: lists lookup failed with %s", e.status)
+        raise
+    if not isinstance(lists, list) or not all(isinstance(item, dict) and "id" in item for item in lists):
+        logger.warning("exclude_list not verified, search not run: unreadable lists response")
+        raise ValueError(
+            "exclude_list could not be verified (your exclusion lists could not be read), so the search "
+            "was not run: the API ignores ids that are not this platform's without notice. Try again."
+        )
+    by_id = {item["id"]: item for item in lists}
+    unknown = sorted({i for i in ids if i not in by_id})
+    wrong_platform = sorted({i for i in ids if i in by_id and by_id[i].get("platform") != platform})
+    problems = []
+    if unknown:
+        problems.append(f"not found in your team: {unknown}")
+    if wrong_platform:
+        problems.append(
+            f"not {platform} lists: "
+            + ", ".join(f"{i} ({by_id[i].get('platform')})" for i in wrong_platform)
+        )
+    if problems:
+        raise ValueError(
+            "exclude_list names exclusion lists the API would ignore — "
+            + "; ".join(problems)
+            + ". Use list_exclusion_lists to find ids for this platform."
+        )
+
+
 
 def _flatten(obj: Any, prefix: str = "") -> dict[str, str]:
     """Flatten a nested dict into dot-separated keys for CSV columns."""
@@ -587,6 +667,7 @@ async def discover_creators(
         _validate_sort(sort_by, sort_order, platform)
         f = coerce_filters(filters)
         f = _map_follower_filter(f, platform)
+        await _check_exclusion_lists(f, platform)
         # ai_search may arrive top-level (preferred) or inside filters; top-level wins.
         ai_search = ai_search or f.pop("ai_search", None)
         if ai_search:
@@ -631,6 +712,7 @@ async def discover_creators_to_file(
         total_pages = min(pages, MAX_EXPORT_PAGES)
         f = coerce_filters(filters)
         f = _map_follower_filter(f, platform)
+        await _check_exclusion_lists(f, platform)
 
         ai_search = ai_search or f.pop("ai_search", None)
         if ai_search:
@@ -730,6 +812,7 @@ async def find_similar_creators(
         filter_value = _validate_handle(filter_value)
         f = coerce_filters(filters)
         f = _map_follower_filter(f, platform)
+        await _check_exclusion_lists(f, platform)
 
         body: dict[str, Any] = {
             "platform": platform,
@@ -740,6 +823,247 @@ async def find_similar_creators(
         if f:
             body["filters"] = f
         result = await client.post(f"{API_V1}/discovery/creators/similar/", body)
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        return _error_response(e)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 2b. EXCLUSION LISTS
+# ═══════════════════════════════════════════════════════════════════════
+# Team-shared, per-platform blocklists of creator handles. One tool per operation of
+# /public/v1/discovery/exclusion-lists/: a specific list is addressed by list_id, a
+# platform's default list by platform. Every call is free. Tools return the API body
+# as is — a list object is {id, name, platform, is_default, handle_count, created_at,
+# updated_at}, a handles page is {total, offset, limit, handles} — except
+# delete_exclusion_list, whose API answer is an empty 204.
+_PLATFORMS_DESC = ", ".join(DISCOVERY_PLATFORMS)
+_LIST_ID_DESC = "ID of a specific exclusion list (from list_exclusion_lists)"
+_DEFAULT_PLATFORM_DESC = f"Platform whose default exclusion list to use ({_PLATFORMS_DESC})"
+_ADD_HANDLES_DESC = (
+    "Creator handles or profile URLs to add. The API normalizes them: lowercased, '@' stripped, "
+    "URLs reduced to the handle."
+)
+_REMOVE_HANDLES_DESC = "Creator handles or profile URLs to remove, normalized the same way as when added"
+_OFFSET_DESC = "Handles to skip, for paging"
+_LIMIT_DESC = "Handles per page (1-2000)"
+
+
+@mcp.tool(
+    name="list_exclusion_lists",
+    annotations={"title": "List Exclusion Lists", "readOnlyHint": True, "destructiveHint": False, "openWorldHint": True},
+)
+async def list_exclusion_lists(
+    platform: Annotated[Optional[str], Field(description=f"Only lists for this platform ({_PLATFORMS_DESC}). Omit for every platform.")] = None,
+) -> str:
+    """List the team's exclusion lists: id, name, platform, is_default, handle_count, created_at, updated_at.
+    Free. Handles are not included — use get_exclusion_list_handles. A platform's default list shows up
+    once it has been used; the *_default_exclusion_list tools address it by platform, no id needed.
+    A list only filters a search when passed in discover_creators / find_similar_creators filters
+    (exclude_list=[ids], exclude_default_list=true or exclude_all_lists=true)."""
+    try:
+        wanted = _validate_platform(platform, DISCOVERY_PLATFORMS) if platform else None
+        lists = await client.get(EXCLUSION_LISTS_PATH)
+        if wanted and isinstance(lists, list):
+            lists = [item for item in lists if item.get("platform") == wanted]
+        return json.dumps(lists, indent=2)
+    except Exception as e:
+        return _error_response(e)
+
+
+@mcp.tool(
+    name="create_exclusion_list",
+    annotations={"title": "Create Exclusion List", "readOnlyHint": False, "destructiveHint": False, "openWorldHint": True},
+)
+async def create_exclusion_list(
+    name: Annotated[str, Field(description="Name of the new list, unique per platform within your account (max 300 chars)", min_length=1, max_length=300)],
+    platform: Annotated[str, Field(description=f"Platform the list applies to ({_PLATFORMS_DESC})")],
+) -> str:
+    """Create a specific exclusion list for one platform and return it, including its id. Free.
+    For a standing, always-on blocklist use the platform's default list instead — it needs no creating,
+    it appears on first use: fill it with add_to_default_exclusion_list. A new list filters nothing
+    by itself: add handles, then pass its id in filters.exclude_list when searching."""
+    try:
+        body = {"name": _validate_list_name(name), "platform": _validate_platform(platform, DISCOVERY_PLATFORMS)}
+        result = await client.post(EXCLUSION_LISTS_PATH, body)
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        return _error_response(e)
+
+
+@mcp.tool(
+    name="get_default_exclusion_list",
+    annotations={"title": "Get Default Exclusion List", "readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
+)
+async def get_default_exclusion_list(
+    platform: Annotated[str, Field(description=_DEFAULT_PLATFORM_DESC)],
+) -> str:
+    """Return a platform's default exclusion list (id, name, handle_count, ...). Free. The default list is
+    the team's standing blocklist for that platform; the API creates it, empty, the first time it is asked
+    for. It cannot be renamed or deleted. Apply it to a search with filters.exclude_default_list=true."""
+    try:
+        result = await client.get(_default_list_path(platform))
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        return _error_response(e)
+
+
+@mcp.tool(
+    name="get_default_exclusion_list_handles",
+    annotations={"title": "Get Default Exclusion List Handles", "readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
+)
+async def get_default_exclusion_list_handles(
+    platform: Annotated[str, Field(description=_DEFAULT_PLATFORM_DESC)],
+    offset: Annotated[int, Field(description=_OFFSET_DESC, ge=0)] = 0,
+    limit: Annotated[int, Field(description=_LIMIT_DESC, ge=1, le=2000)] = 1000,
+) -> str:
+    """Page through the handles in a platform's default exclusion list. Returns {total, offset, limit,
+    handles}, handles in alphabetical order. Free. The API creates the list, empty, on first use."""
+    try:
+        path = _default_list_path(platform) + "entries/"
+        result = await client.get(path, params={"offset": str(offset), "limit": str(limit)})
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        return _error_response(e)
+
+
+@mcp.tool(
+    name="add_to_default_exclusion_list",
+    annotations={"title": "Add to Default Exclusion List", "readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
+)
+async def add_to_default_exclusion_list(
+    platform: Annotated[str, Field(description=_DEFAULT_PLATFORM_DESC)],
+    handles: Annotated[list[str], Field(description=_ADD_HANDLES_DESC, min_length=1, max_length=10_000)],
+) -> str:
+    """Add handles to a platform's default exclusion list and return the updated list (handle_count counts
+    unique handles). Free; adding a handle that is already there is a no-op. Adding handles filters nothing
+    by itself: pass filters.exclude_default_list=true when searching."""
+    try:
+        path = _default_list_path(platform) + "entries/"
+        result = await client.post(path, {"handles": _validate_handles(handles)})
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        return _error_response(e)
+
+
+@mcp.tool(
+    name="remove_from_default_exclusion_list",
+    annotations={"title": "Remove from Default Exclusion List", "readOnlyHint": False, "destructiveHint": True, "idempotentHint": True, "openWorldHint": True},
+)
+async def remove_from_default_exclusion_list(
+    platform: Annotated[str, Field(description=_DEFAULT_PLATFORM_DESC)],
+    handles: Annotated[list[str], Field(description=_REMOVE_HANDLES_DESC, min_length=1, max_length=10_000)],
+) -> str:
+    """Remove handles from a platform's default exclusion list and return the updated list. Free; removing
+    a handle that is not there is a no-op."""
+    try:
+        path = _default_list_path(platform) + "entries/"
+        result = await client.delete(path, {"handles": _validate_handles(handles)})
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        return _error_response(e)
+
+
+@mcp.tool(
+    name="get_exclusion_list",
+    annotations={"title": "Get Exclusion List", "readOnlyHint": True, "destructiveHint": False, "openWorldHint": True},
+)
+async def get_exclusion_list(
+    list_id: Annotated[int, Field(description=_LIST_ID_DESC, ge=1)],
+) -> str:
+    """Return one specific exclusion list by id: id, name, platform, is_default, handle_count, created_at,
+    updated_at. Free. Handles are not included — use get_exclusion_list_handles."""
+    try:
+        result = await client.get(_list_path(list_id))
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        return _error_response(e)
+
+
+@mcp.tool(
+    name="rename_exclusion_list",
+    annotations={"title": "Rename Exclusion List", "readOnlyHint": False, "destructiveHint": False, "openWorldHint": True},
+)
+async def rename_exclusion_list(
+    list_id: Annotated[int, Field(description=_LIST_ID_DESC, ge=1)],
+    name: Annotated[str, Field(description="New name, unique per platform within your account (max 300 chars)", min_length=1, max_length=300)],
+) -> str:
+    """Rename a specific exclusion list and return the updated list. Free. Default lists cannot be renamed."""
+    try:
+        result = await client.patch(_list_path(list_id), {"name": _validate_list_name(name)})
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        return _error_response(e)
+
+
+@mcp.tool(
+    name="delete_exclusion_list",
+    annotations={"title": "Delete Exclusion List", "readOnlyHint": False, "destructiveHint": True, "openWorldHint": True},
+)
+async def delete_exclusion_list(
+    list_id: Annotated[int, Field(description=_LIST_ID_DESC, ge=1)],
+) -> str:
+    """Permanently delete a specific exclusion list and every handle in it. Free, cannot be undone.
+    Returns {deleted: true, id}. Default lists cannot be deleted — empty one with
+    remove_from_default_exclusion_list instead."""
+    try:
+        await client.delete(_list_path(list_id))
+        return json.dumps({"deleted": True, "id": list_id}, indent=2)
+    except Exception as e:
+        return _error_response(e)
+
+
+@mcp.tool(
+    name="get_exclusion_list_handles",
+    annotations={"title": "Get Exclusion List Handles", "readOnlyHint": True, "destructiveHint": False, "openWorldHint": True},
+)
+async def get_exclusion_list_handles(
+    list_id: Annotated[int, Field(description=_LIST_ID_DESC, ge=1)],
+    offset: Annotated[int, Field(description=_OFFSET_DESC, ge=0)] = 0,
+    limit: Annotated[int, Field(description=_LIMIT_DESC, ge=1, le=2000)] = 1000,
+) -> str:
+    """Page through the handles in a specific exclusion list. Returns {total, offset, limit, handles},
+    handles in alphabetical order. Free."""
+    try:
+        path = _list_path(list_id) + "entries/"
+        result = await client.get(path, params={"offset": str(offset), "limit": str(limit)})
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        return _error_response(e)
+
+
+@mcp.tool(
+    name="add_to_exclusion_list",
+    annotations={"title": "Add to Exclusion List", "readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
+)
+async def add_to_exclusion_list(
+    list_id: Annotated[int, Field(description=_LIST_ID_DESC, ge=1)],
+    handles: Annotated[list[str], Field(description=_ADD_HANDLES_DESC, min_length=1, max_length=10_000)],
+) -> str:
+    """Add handles to a specific exclusion list and return the updated list (handle_count counts unique
+    handles). Free; adding a handle that is already there is a no-op. Adding handles filters nothing by
+    itself: pass the list's id in filters.exclude_list when searching."""
+    try:
+        path = _list_path(list_id) + "entries/"
+        result = await client.post(path, {"handles": _validate_handles(handles)})
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        return _error_response(e)
+
+
+@mcp.tool(
+    name="remove_from_exclusion_list",
+    annotations={"title": "Remove from Exclusion List", "readOnlyHint": False, "destructiveHint": True, "idempotentHint": True, "openWorldHint": True},
+)
+async def remove_from_exclusion_list(
+    list_id: Annotated[int, Field(description=_LIST_ID_DESC, ge=1)],
+    handles: Annotated[list[str], Field(description=_REMOVE_HANDLES_DESC, min_length=1, max_length=10_000)],
+) -> str:
+    """Remove handles from a specific exclusion list and return the updated list. Free; removing a handle
+    that is not there is a no-op."""
+    try:
+        path = _list_path(list_id) + "entries/"
+        result = await client.delete(path, {"handles": _validate_handles(handles)})
         return json.dumps(result, indent=2)
     except Exception as e:
         return _error_response(e)
