@@ -389,9 +389,27 @@ def test_odd_types_in_the_api_response_do_not_fail_the_shaping():
     assert out["result"]["youtube"] == {"audience": ["unexpected"], "brand_affinity": ["Brand 1"]}
 
 
+def test_the_top_level_fields_of_a_result_all_stay():
+    """The rules apply to what is under each top-level field, never to the field itself."""
+    out = shape_result(
+        {"result": {"user_id": "42", "profile_picture": "https://example.com/p.jpg",
+                    "banner": "https://i.ytimg.com/vi/1/hq.jpg", "email": "a@b.c"}},
+        list(ENRICH_SECTIONS), ENRICH_SECTIONS, "compact",
+    )
+    assert out["result"] == {"user_id": "42", "profile_picture": "https://example.com/p.jpg",
+                             "banner": "https://i.ytimg.com/vi/1/hq.jpg", "email": "a@b.c"}
+
+
+def test_numbers_in_a_media_summary_are_rounded_like_any_other():
+    posts = [{"post_id": "1", "media": {"aspect_ratio": 1.7777777, "duration": "PT40S",
+                                         "thumbnail": "https://i.ytimg.com/vi/1/hq.jpg"}}]
+    out = shape_result({"result": {"youtube": {"post_data": posts}}}, list(ENRICH_SECTIONS), ENRICH_SECTIONS, "compact")
+    assert out["result"]["youtube"]["post_data"] == [{"post_id": "1", "media": {"aspect_ratio": 1.78, "duration": "PT40S"}}]
+
+
 def test_a_shaping_bug_returns_the_data_as_it_came(monkeypatch):
     """The credit is spent by the time the result is shaped, so a bug must not cost it."""
-    monkeypatch.setattr(enrich_results._Shaper, "result", lambda self, result: 1 / 0)
+    monkeypatch.setattr(enrich_results, "_shape", lambda *args, **kwargs: 1 / 0)
 
     out = shape_result(response(), list(ENRICH_SECTIONS), ENRICH_SECTIONS, "compact")
     assert out["result"] == response()["result"]
