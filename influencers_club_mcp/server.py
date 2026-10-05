@@ -426,18 +426,7 @@ def _validate_handle(handle: str) -> str:
     return h
 
 
-EXCLUSION_LISTS_PATH = f"{API_V1}/discovery/exclusion-lists/"
 _MAX_IDS_IN_ERROR = 10
-
-
-def _list_path(list_id: int) -> str:
-    """Route of a specific exclusion list: ``/exclusion-lists/{list_id}/``."""
-    return f"{EXCLUSION_LISTS_PATH}{list_id}/"
-
-
-def _default_list_path(platform: str) -> str:
-    """Route of a platform's default exclusion list: ``/exclusion-lists/default/{platform}/``."""
-    return f"{EXCLUSION_LISTS_PATH}default/{_validate_platform(platform, DISCOVERY_PLATFORMS)}/"
 
 
 def _validate_handles(handles: list[str]) -> list[str]:
@@ -471,7 +460,7 @@ async def _check_exclusion_lists(filters: dict, platform: str) -> None:
     if not ids or filters.get("exclude_all_lists"):
         return
     try:
-        lists = await client.get(EXCLUSION_LISTS_PATH)
+        lists = await client.exclusion_lists.list_all()
     except ApiError as e:
         logger.warning("exclude_list not verified, search not run: lists lookup failed with %s", e.status)
         raise
@@ -838,12 +827,13 @@ async def find_similar_creators(
 # ═══════════════════════════════════════════════════════════════════════
 # 2b. EXCLUSION LISTS
 # ═══════════════════════════════════════════════════════════════════════
-# Team-shared, per-platform blocklists of creator handles. One tool per operation of
-# /public/v1/discovery/exclusion-lists/: a specific list is addressed by list_id, a
-# platform's default list by platform. Every call is free. Tools return the API body
-# as is — a list object is {id, name, platform, is_default, handle_count, created_at,
-# updated_at}, a handles page is {total, offset, limit, handles} — except
-# delete_exclusion_list, whose API answer is an empty 204.
+# Team-shared, per-platform blocklists of creator handles. One tool per API operation:
+# a specific list is addressed by list_id, a platform's default list by platform.
+# The API calls live in api_exclusion_lists.py, reached as client.exclusion_lists; a
+# tool checks its input, hands over, and returns the answer as is — a list object is
+# {id, name, platform, is_default, handle_count, created_at, updated_at}, a handles
+# page is {total, offset, limit, handles}. Only delete_exclusion_list builds its own
+# answer, because the API's is an empty 204. Every call is free.
 _PLATFORMS_DESC = ", ".join(DISCOVERY_PLATFORMS)
 _LIST_ID_DESC = "ID of a specific exclusion list (from list_exclusion_lists)"
 _DEFAULT_PLATFORM_DESC = f"Platform whose default exclusion list to use ({_PLATFORMS_DESC})"
@@ -870,7 +860,7 @@ async def list_exclusion_lists(
     (exclude_list=[ids], exclude_default_list=true or exclude_all_lists=true)."""
     try:
         wanted = _validate_platform(platform, DISCOVERY_PLATFORMS) if platform else None
-        lists = await client.get(EXCLUSION_LISTS_PATH)
+        lists = await client.exclusion_lists.list_all()
         if wanted and isinstance(lists, list):
             lists = [item for item in lists if item.get("platform") == wanted]
         return json.dumps(lists, indent=2)
@@ -891,8 +881,9 @@ async def create_exclusion_list(
     it appears on first use: fill it with add_to_default_exclusion_list. A new list filters nothing
     by itself: add handles, then pass its id in filters.exclude_list when searching."""
     try:
-        body = {"name": _validate_list_name(name), "platform": _validate_platform(platform, DISCOVERY_PLATFORMS)}
-        result = await client.post(EXCLUSION_LISTS_PATH, body)
+        name = _validate_list_name(name)
+        platform = _validate_platform(platform, DISCOVERY_PLATFORMS)
+        result = await client.exclusion_lists.create(name, platform)
         return json.dumps(result, indent=2)
     except Exception as e:
         return _error_response(e)
@@ -909,7 +900,8 @@ async def get_default_exclusion_list(
     the team's standing blocklist for that platform; the API creates it, empty, the first time it is asked
     for. It cannot be renamed or deleted. Apply it to a search with filters.exclude_default_list=true."""
     try:
-        result = await client.get(_default_list_path(platform))
+        platform = _validate_platform(platform, DISCOVERY_PLATFORMS)
+        result = await client.exclusion_lists.get_default(platform)
         return json.dumps(result, indent=2)
     except Exception as e:
         return _error_response(e)
@@ -927,8 +919,8 @@ async def get_default_exclusion_list_handles(
     """Page through the handles in a platform's default exclusion list. Returns {total, offset, limit,
     handles}, handles in alphabetical order. Free. The API creates the list, empty, on first use."""
     try:
-        path = _default_list_path(platform) + "entries/"
-        result = await client.get(path, params={"offset": str(offset), "limit": str(limit)})
+        platform = _validate_platform(platform, DISCOVERY_PLATFORMS)
+        result = await client.exclusion_lists.get_default_handles(platform, offset, limit)
         return json.dumps(result, indent=2)
     except Exception as e:
         return _error_response(e)
@@ -946,8 +938,8 @@ async def add_to_default_exclusion_list(
     unique handles). Free; adding a handle that is already there is a no-op. Adding handles filters nothing
     by itself: pass filters.exclude_default_list=true when searching."""
     try:
-        path = _default_list_path(platform) + "entries/"
-        result = await client.post(path, {"handles": _validate_handles(handles)})
+        platform = _validate_platform(platform, DISCOVERY_PLATFORMS)
+        result = await client.exclusion_lists.add_default_handles(platform, _validate_handles(handles))
         return json.dumps(result, indent=2)
     except Exception as e:
         return _error_response(e)
@@ -964,8 +956,8 @@ async def remove_from_default_exclusion_list(
     """Remove handles from a platform's default exclusion list and return the updated list. Free; removing
     a handle that is not there is a no-op."""
     try:
-        path = _default_list_path(platform) + "entries/"
-        result = await client.delete(path, {"handles": _validate_handles(handles)})
+        platform = _validate_platform(platform, DISCOVERY_PLATFORMS)
+        result = await client.exclusion_lists.remove_default_handles(platform, _validate_handles(handles))
         return json.dumps(result, indent=2)
     except Exception as e:
         return _error_response(e)
@@ -981,7 +973,7 @@ async def get_exclusion_list(
     """Return one specific exclusion list by id: id, name, platform, is_default, handle_count, created_at,
     updated_at. Free. Handles are not included — use get_exclusion_list_handles."""
     try:
-        result = await client.get(_list_path(list_id))
+        result = await client.exclusion_lists.get(list_id)
         return json.dumps(result, indent=2)
     except Exception as e:
         return _error_response(e)
@@ -997,7 +989,7 @@ async def rename_exclusion_list(
 ) -> str:
     """Rename a specific exclusion list and return the updated list. Free. Default lists cannot be renamed."""
     try:
-        result = await client.patch(_list_path(list_id), {"name": _validate_list_name(name)})
+        result = await client.exclusion_lists.rename(list_id, _validate_list_name(name))
         return json.dumps(result, indent=2)
     except Exception as e:
         return _error_response(e)
@@ -1014,7 +1006,7 @@ async def delete_exclusion_list(
     Returns {deleted: true, id}. Default lists cannot be deleted — empty one with
     remove_from_default_exclusion_list instead."""
     try:
-        await client.delete(_list_path(list_id))
+        await client.exclusion_lists.delete(list_id)
         return json.dumps({"deleted": True, "id": list_id}, indent=2)
     except Exception as e:
         return _error_response(e)
@@ -1032,8 +1024,7 @@ async def get_exclusion_list_handles(
     """Page through the handles in a specific exclusion list. Returns {total, offset, limit, handles},
     handles in alphabetical order. Free."""
     try:
-        path = _list_path(list_id) + "entries/"
-        result = await client.get(path, params={"offset": str(offset), "limit": str(limit)})
+        result = await client.exclusion_lists.get_handles(list_id, offset, limit)
         return json.dumps(result, indent=2)
     except Exception as e:
         return _error_response(e)
@@ -1051,8 +1042,7 @@ async def add_to_exclusion_list(
     handles). Free; adding a handle that is already there is a no-op. Adding handles filters nothing by
     itself: pass the list's id in filters.exclude_list when searching."""
     try:
-        path = _list_path(list_id) + "entries/"
-        result = await client.post(path, {"handles": _validate_handles(handles)})
+        result = await client.exclusion_lists.add_handles(list_id, _validate_handles(handles))
         return json.dumps(result, indent=2)
     except Exception as e:
         return _error_response(e)
@@ -1069,8 +1059,7 @@ async def remove_from_exclusion_list(
     """Remove handles from a specific exclusion list and return the updated list. Free; removing a handle
     that is not there is a no-op."""
     try:
-        path = _list_path(list_id) + "entries/"
-        result = await client.delete(path, {"handles": _validate_handles(handles)})
+        result = await client.exclusion_lists.remove_handles(list_id, _validate_handles(handles))
         return json.dumps(result, indent=2)
     except Exception as e:
         return _error_response(e)

@@ -14,6 +14,7 @@ import pytest
 
 from influencers_club_mcp import server
 from influencers_club_mcp.api_client import ApiError, InfluencersApiClient
+from influencers_club_mcp.api_exclusion_lists import ExclusionListsApi
 from influencers_club_mcp.discovery_filters import coerce_filters
 
 BASE = "/public/v1/discovery/exclusion-lists/"
@@ -34,11 +35,16 @@ SEARCH = {"total": 0, "limit": 20, "credits_left": "10.00", "accounts": []}
 
 
 class FakeClient:
-    """Records every call and answers each from a queue of canned API bodies."""
+    """Records every request and answers each from a queue of canned API bodies.
+
+    Only the transport is faked: ``exclusion_lists`` is the real endpoint group, so the
+    recorded calls are the requests a tool really makes.
+    """
 
     def __init__(self, *answers):
         self.answers = list(answers)
         self.calls = []
+        self.exclusion_lists = ExclusionListsApi(self)
 
     async def _answer(self, method, path, body=None, params=None):
         self.calls.append((method, path, body, params))
@@ -326,7 +332,7 @@ def test_tools_are_registered_with_honest_annotations():
 # --- HTTP verbs ---------------------------------------------------------------------
 
 
-def test_patch_and_delete_over_http(monkeypatch):
+def test_exclusion_list_calls_over_the_real_client(monkeypatch):
     monkeypatch.setenv("INFLUENCERS_CLUB_API_KEY", "key")
     seen = []
 
@@ -350,14 +356,14 @@ def test_patch_and_delete_over_http(monkeypatch):
     client._client = httpx.AsyncClient(base_url="https://api.test", transport=httpx.MockTransport(handler))
 
     async def scenario():
-        removed = await client.delete(f"{BASE}42/entries/", {"handles": ["a"]})
-        deleted = await client.delete(f"{BASE}42/")
-        renamed = await client.patch(f"{BASE}42/", {"name": "n"})
+        removed = await client.exclusion_lists.remove_handles(42, ["a"])
+        deleted = await client.exclusion_lists.delete(42)
+        renamed = await client.exclusion_lists.rename(42, "n")
         errors = []
         for call in (
-            client.delete(f"{BASE}43/"),
-            client.patch(f"{BASE}44/", {"name": "n"}),
-            client.patch(f"{BASE}45/", {"name": "n"}),
+            client.exclusion_lists.delete(43),
+            client.exclusion_lists.rename(44, "n"),
+            client.exclusion_lists.rename(45, "n"),
             client.post("/nested", {}),
         ):
             try:
@@ -383,3 +389,69 @@ def test_patch_and_delete_over_http(monkeypatch):
         (400, "name: A list with this name already exists for this platform."),
         (400, "filters: engagement_percent: A valid number is required."),
     ]
+
+
+def test_every_operation_on_the_real_client(monkeypatch):
+    """All twelve methods, through InfluencersApiClient itself: verb, path, query and body."""
+    monkeypatch.setenv("INFLUENCERS_CLUB_API_KEY", "key")
+    seen = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content) if request.content else None
+        seen.append((request.method, request.url.path, dict(request.url.params), body))
+        return httpx.Response(204) if request.method == "DELETE" and body is None else httpx.Response(200, json={})
+
+    client = InfluencersApiClient()
+    client._client = httpx.AsyncClient(base_url="https://api.test", transport=httpx.MockTransport(handler))
+    lists = client.exclusion_lists
+
+    async def scenario():
+        await lists.list_all()
+        await lists.create("n", "tiktok")
+        await lists.get(42)
+        await lists.get_default("tiktok")
+        await lists.rename(42, "m")
+        await lists.delete(42)
+        await lists.get_handles(42, 5, 10)
+        await lists.get_default_handles("tiktok", 5, 10)
+        await lists.add_handles(42, ["a"])
+        await lists.add_default_handles("tiktok", ["a"])
+        await lists.remove_handles(42, ["a"])
+        await lists.remove_default_handles("tiktok", ["a"])
+        await client._client.aclose()
+
+    asyncio.run(scenario())
+    page, handles = {"offset": "5", "limit": "10"}, {"handles": ["a"]}
+    assert seen == [
+        ("GET", BASE, {}, None),
+        ("POST", BASE, {}, {"name": "n", "platform": "tiktok"}),
+        ("GET", f"{BASE}42/", {}, None),
+        ("GET", f"{BASE}default/tiktok/", {}, None),
+        ("PATCH", f"{BASE}42/", {}, {"name": "m"}),
+        ("DELETE", f"{BASE}42/", {}, None),
+        ("GET", f"{BASE}42/entries/", page, None),
+        ("GET", f"{BASE}default/tiktok/entries/", page, None),
+        ("POST", f"{BASE}42/entries/", {}, handles),
+        ("POST", f"{BASE}default/tiktok/entries/", {}, handles),
+        ("DELETE", f"{BASE}42/entries/", {}, handles),
+        ("DELETE", f"{BASE}default/tiktok/entries/", {}, handles),
+    ]
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        lambda lists: lists.get_default("instagram/../../accounts/credits"),
+        lambda lists: lists.add_default_handles("instagram?x=1", ["a"]),
+        lambda lists: lists.get_default_handles("", 0, 10),
+        lambda lists: lists.get("7/entries"),
+        lambda lists: lists.delete(0),
+        lambda lists: lists.rename(True, "n"),
+    ],
+)
+def test_the_client_never_builds_an_address_from_an_unchecked_id_or_platform(call):
+    """These two values become part of the URL, so the endpoint group checks them itself."""
+    fake = FakeClient()
+    with pytest.raises(ValueError):
+        asyncio.run(call(fake.exclusion_lists))
+    assert fake.calls == []

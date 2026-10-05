@@ -2,6 +2,9 @@
 HTTP client for the Influencers.club API.
 Handles authentication, rate limiting, timeouts, error normalization,
 credential redaction, and debug logging to stderr.
+
+The endpoints of an API area live in their own module (api_exclusion_lists.py)
+and hang off the client: ``client.exclusion_lists.create(...)``.
 """
 
 import json
@@ -14,6 +17,7 @@ from typing import Any, Callable, NamedTuple
 import httpx
 from cachetools import TLRUCache
 
+from .api_exclusion_lists import ExclusionListsApi
 from .auth import invalidate_cached_token
 from .oauth_config import load_oauth_config
 
@@ -132,6 +136,10 @@ class InfluencersApiClient:
         max_rate = int(os.environ.get("MAX_CALLS_PER_MINUTE", str(RATE_LIMIT)))
         self._rate_limiter = _SlidingWindowRateLimiter(max_rate, RATE_WINDOW)
         self._client: httpx.AsyncClient | None = None
+
+        # Endpoint groups, one module per API area. Each sends through get/post/
+        # patch/delete below, so auth, rate limiting and error handling stay here.
+        self.exclusion_lists = ExclusionListsApi(self)
 
     async def _resolve_token(self) -> str:
         """Resolve the bearer token to send to the dashboard API.
