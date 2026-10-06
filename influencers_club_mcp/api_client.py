@@ -2,6 +2,10 @@
 HTTP client for the Influencers.club API.
 Handles authentication, rate limiting, timeouts, error normalization,
 credential redaction, and debug logging to stderr.
+
+The endpoints of each API area live in their own module (api_discovery.py,
+api_enrichment.py, api_batch.py, api_content.py, api_account.py) and hang off
+the client: ``client.discovery.search(...)``, ``client.account.credits()``.
 """
 
 import json
@@ -14,6 +18,11 @@ from typing import Any, Callable, NamedTuple
 import httpx
 from cachetools import TLRUCache
 
+from .api_account import AccountApi
+from .api_batch import BatchApi
+from .api_content import ContentApi
+from .api_discovery import DiscoveryApi
+from .api_enrichment import EnrichmentApi
 from .auth import invalidate_cached_token
 from .oauth_config import load_oauth_config
 
@@ -119,6 +128,14 @@ class InfluencersApiClient:
         max_rate = int(os.environ.get("MAX_CALLS_PER_MINUTE", str(RATE_LIMIT)))
         self._rate_limiter = _SlidingWindowRateLimiter(max_rate, RATE_WINDOW)
         self._client: httpx.AsyncClient | None = None
+
+        # Endpoint groups, one module per API area. Each sends through get/post/
+        # patch/delete below, so auth, rate limiting and error handling stay here.
+        self.discovery = DiscoveryApi(self)
+        self.enrichment = EnrichmentApi(self)
+        self.batch = BatchApi(self)
+        self.content = ContentApi(self)
+        self.account = AccountApi(self)
 
     async def _resolve_token(self) -> str:
         """Resolve the bearer token to send to the dashboard API.
