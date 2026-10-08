@@ -231,6 +231,20 @@ class DiscoveryFilters(_Base):
     exclude_handles: Optional[list[str]] = Field(default=None, max_length=10_000)
     exclude_role_based_emails: Optional[bool] = None
 
+    # Customer-managed exclusion lists (see the exclusion-list tools). Only lists for the
+    # searched platform apply — the API skips the rest without an error, so the discovery
+    # tools verify the ids before searching.
+    exclude_list: Optional[list[int]] = Field(
+        default=None,
+        description="IDs of exclusion lists to apply (from list_exclusion_lists; must belong to this platform).",
+    )
+    exclude_default_list: Optional[bool] = Field(
+        default=None, description="Apply the team's default exclusion list for this platform."
+    )
+    exclude_all_lists: Optional[bool] = Field(
+        default=None, description="Apply every exclusion list for this platform (the default and all specific lists)."
+    )
+
     @field_validator("creator_has")
     @classmethod
     def _known_creator_has_keys(cls, v: dict[str, bool] | None) -> dict[str, bool] | None:

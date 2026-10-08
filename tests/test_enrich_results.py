@@ -629,7 +629,7 @@ def test_the_analytics_tool_returns_compact_json(api):
     assert "sponsored_posts" in out["result"]["instagram"]
     assert out["notes"][0].startswith("Left out")
     assert api == [(
-        f"{server.API_V1}/creators/enrich/handle/analytics/",
+        "/public/v1/creators/enrich/handle/analytics/",
         {"handle": "creator", "platform": "instagram", "include_lookalikes": True},
     )]
 
@@ -638,7 +638,7 @@ def test_the_full_tool_can_return_the_raw_response(api):
     text = asyncio.run(server.enrich_by_handle(handle="creator", platform="instagram", detail="raw"))
 
     assert json.loads(text) == response()
-    assert api[0][0] == f"{server.API_V1}/creators/enrich/handle/full/"
+    assert api[0][0] == "/public/v1/creators/enrich/handle/full/"
 
 
 def test_the_profile_tool_leaves_out_image_links(api):
@@ -660,7 +660,7 @@ def test_the_profile_tool_leaves_out_image_links(api):
         "instagram.post_data: 1 of 5 captions cut to 120 characters.",
         "other_links: the first 30 of 35 links.",
     ]
-    assert api[0][0] == f"{server.API_V1}/creators/enrich/handle/profile/"
+    assert api[0][0] == "/public/v1/creators/enrich/handle/profile/"
 
 
 def test_the_profile_tool_returns_every_link_on_request(api):
