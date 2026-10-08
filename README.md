@@ -23,7 +23,7 @@ The hosted server runs at `https://mcp-dashboard.influencers.club/mcp` and signs
 **Requirements:** an [Influencers Club](https://influencers.club) account with API credits. Discovery and enrichment tools consume credits (costs are listed on every tool and in the tables below); dictionary/lookup tools are free.
 
 **Notes:**
-- The hosted connector exposes the 21 API tools. File and batch tools (CSV export, bulk CSV enrichment) need a local filesystem and are available only in the [local install](#local-install-stdio).
+- The hosted connector exposes the API tools. File and batch tools (CSV export, bulk CSV enrichment) need a local filesystem and are available only in the [local install](#local-install-stdio).
 - **Connection expired / 401 errors:** disconnect and reconnect the connector to re-authenticate.
 - **"Insufficient credits" errors:** top up in the [dashboard](https://dashboard.influencers.club); calls keep failing until the balance is positive.
 
@@ -34,7 +34,7 @@ The same hosted server works as a ChatGPT connector:
 1. In ChatGPT, enable **Settings → Apps → Advanced settings → Developer mode** (available on Plus, Pro, Business, Enterprise, and Edu plans).
 2. Add a new connector with the URL: `https://mcp-dashboard.influencers.club/mcp`
 3. Click **Connect** — you'll be redirected to the Influencers Club dashboard to sign in and approve access.
-4. Done. The same 21 API tools are available; the credit requirements and notes from the claude.ai section apply unchanged.
+4. Done. The same API tools are available; the credit requirements and notes from the claude.ai section apply unchanged.
 
 ## Local Install (stdio)
 
@@ -161,9 +161,9 @@ Add to your Claude Desktop `claude_desktop_config.json`:
 
 After configuring, restart your client. The server will appear as "influencers-club".
 
-## Available Tools (31)
+## Available Tools
 
-21 API tools are available everywhere (hosted connector and local). Tools marked **local only** need the local filesystem, so they exist only in stdio installs.
+API tools are available everywhere (hosted connector and local). Tools marked **local only** need the local filesystem, so they exist only in stdio installs.
 
 ### Creator Discovery
 

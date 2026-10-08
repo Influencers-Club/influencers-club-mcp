@@ -1098,7 +1098,7 @@ async def enrich_by_handle(
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# 14A. ENRICH BY HANDLE (PROFILE)
+# ENRICH BY HANDLE (PROFILE)
 # ═══════════════════════════════════════════════════════════════════════
 @mcp.tool(
     name="enrich_by_handle_profile",
@@ -1137,7 +1137,7 @@ async def enrich_by_handle_profile(
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# 14B. ENRICH BY HANDLE (ANALYTICS)
+# ENRICH BY HANDLE (ANALYTICS)
 # ═══════════════════════════════════════════════════════════════════════
 @mcp.tool(
     name="enrich_by_handle_analytics",
