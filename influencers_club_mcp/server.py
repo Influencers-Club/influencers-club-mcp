@@ -24,7 +24,7 @@ from pydantic import Field
 
 from .api_client import ApiError, InfluencersApiClient, _sanitize
 from .auth import IntrospectionUnavailableMiddleware
-from .csv_export import creators_to_csv
+from .csv_export import creators_to_csv, json_batch_to_csv, preview_rows
 from .csv_import import count_csv_rows, mostly_emails, to_single_column
 from .discovery_filters import DiscoveryFilters, coerce_filters
 from .log_config import configure_logging
@@ -32,8 +32,6 @@ from .log_config import configure_logging
 logger = logging.getLogger(__name__)
 
 # ─── Constants ─────────────────────────────────────────────────────────
-API_V1 = "/public/v1"
-
 def _is_docker() -> bool:
     """Detect if running inside a Docker container."""
     return os.path.exists("/.dockerenv") or os.path.exists("/run/.containerenv")
@@ -435,128 +433,6 @@ def _validate_handle(handle: str) -> str:
 
 
 
-def _flatten(obj: Any, prefix: str = "") -> dict[str, str]:
-    """Flatten a nested dict into dot-separated keys for CSV columns."""
-    out: dict[str, str] = {}
-    if isinstance(obj, dict):
-        for k, v in obj.items():
-            key = f"{prefix}{k}" if not prefix else f"{prefix}.{k}"
-            if isinstance(v, dict):
-                out.update(_flatten(v, key))
-            elif isinstance(v, (list, tuple)):
-                out[key] = json.dumps(v) if v else ""
-            else:
-                out[key] = "" if v is None else str(v)
-    return out
-
-
-def _preview_rows(data: list[dict], max_rows: int = 5) -> list[dict[str, str]]:
-    """Build a preview of the first N rows with key columns for UI display.
-
-    Dynamically selects platform-specific columns based on what's actually
-    present in the data, so previews work for any enrichment mode/platform.
-    """
-    # Always-show columns first, then platform-specific candidates in priority order
-    always_keys = ["handle"]
-    # Keys from email enrichment results (enrich_by_email / basic mode)
-    email_keys = ["platform", "username", "fullname", "followers"]
-    common_keys = ["first_name", "gender", "location", "is_creator", "has_brand_deals"]
-    platform_keys_by_prefix = {
-        "instagram": ["instagram.username", "instagram.follower_count", "instagram.engagement_percent"],
-        "tiktok": ["tiktok.username", "tiktok.follower_count", "tiktok.engagement_percent"],
-        "youtube": ["youtube.username", "youtube.subscriber_count", "youtube.engagement_percent"],
-        "twitter": ["twitter.username", "twitter.follower_count"],
-        "twitch": ["twitch.username", "twitch.follower_count"],
-    }
-
-    # Filter out not_found / failed rows — only show successful results in preview
-    data = [item for item in data if item.get("status") != "not_found" and item.get("status") != "failed"]
-
-    # Flatten a sample of rows to discover which keys exist
-    sample_flats = []
-    for item in data[:max_rows]:
-        flat: dict[str, str] = {}
-        for k, v in item.items():
-            if k in ("result", "enrichment_data") and isinstance(v, dict):
-                flat.update(_flatten(v))
-            elif isinstance(v, dict):
-                flat.update(_flatten(v, k))
-            elif isinstance(v, (list, tuple)):
-                flat[k] = json.dumps(v) if v else ""
-            else:
-                flat[k] = "" if v is None else str(v)
-        if "handle" not in flat and "input_value" in flat:
-            flat["handle"] = flat.pop("input_value")
-        elif "handle" in flat and "input_value" in flat:
-            flat.pop("input_value")
-        sample_flats.append(flat)
-
-    # Detect which platform columns are present
-    all_sample_keys = set()
-    for f in sample_flats:
-        all_sample_keys.update(f.keys())
-
-    platform_cols: list[str] = []
-    for prefix, cols in platform_keys_by_prefix.items():
-        if any(k in all_sample_keys for k in cols):
-            platform_cols.extend(c for c in cols if c in all_sample_keys)
-
-    preview_keys = always_keys + [k for k in email_keys if k in all_sample_keys] + [k for k in common_keys if k in all_sample_keys] + platform_cols
-
-    rows = []
-    for flat in sample_flats:
-        row = {k: flat[k] for k in preview_keys if k in flat}
-        rows.append(row)
-    return rows
-
-
-def _json_batch_to_csv(data: Any) -> str:
-    """Convert batch JSON response (list of objects) to CSV string."""
-    import csv
-    import io
-
-    if isinstance(data, dict):
-        # Sometimes API wraps in a dict
-        data = data.get("results", data.get("data", [data]))
-    if not isinstance(data, list) or not data:
-        return ""
-
-    # Flatten all rows and collect all column names
-    rows: list[dict[str, str]] = []
-    all_keys: list[str] = []
-    seen_keys: set[str] = set()
-
-    for item in data:
-        flat: dict[str, str] = {}
-        # Flatten all top-level fields (input_value, status, handle, email, etc.)
-        for k, v in item.items():
-            if k in ("result", "enrichment_data") and isinstance(v, dict):
-                # Promote result / enrichment_data contents to top-level (no prefix)
-                flat.update(_flatten(v))
-            elif isinstance(v, dict):
-                flat.update(_flatten(v, k))
-            elif isinstance(v, (list, tuple)):
-                flat[k] = json.dumps(v) if v else ""
-            else:
-                flat[k] = "" if v is None else str(v)
-        # Ensure handle column: use input_value as fallback
-        if "handle" not in flat and "input_value" in flat:
-            flat["handle"] = flat.pop("input_value")
-        elif "handle" in flat and "input_value" in flat:
-            flat.pop("input_value")  # avoid duplicate
-        rows.append(flat)
-        for k in flat:
-            if k not in seen_keys:
-                seen_keys.add(k)
-                all_keys.append(k)
-
-    buf = io.StringIO()
-    writer = csv.DictWriter(buf, fieldnames=all_keys, extrasaction="ignore")
-    writer.writeheader()
-    writer.writerows(rows)
-    return buf.getvalue()
-
-
 def _error_response(e: Exception) -> str:
     if isinstance(e, ApiError):
         return json.dumps({"error": True, "status": e.status, "message": e.message, "retryable": e.retryable})
@@ -608,13 +484,7 @@ async def discover_creators(
             ai_search = _validate_ai_search(ai_search)
             f["ai_search"] = ai_search
 
-        body = {
-            "platform": platform,
-            "paging": {"limit": limit, "page": page},
-            "sort": {"sort_by": sort_by, "sort_order": sort_order},
-            "filters": f if f else None,
-        }
-        result = await client.post(f"{API_V1}/discovery/", body)
+        result = await client.discovery.search(platform, f, page=page, limit=limit, sort_by=sort_by, sort_order=sort_order)
         return json.dumps(result, indent=2)
     except Exception as e:
         return _error_response(e)
@@ -661,13 +531,7 @@ async def discover_creators_to_file(
         total_available = 0
 
         for page in range(0, total_pages):
-            body = {
-                "platform": platform,
-                "paging": {"limit": 50, "page": page},
-                "sort": {"sort_by": sort_by, "sort_order": sort_order},
-                "filters": f if f else None,
-            }
-            result = await client.post(f"{API_V1}/discovery/", body)
+            result = await client.discovery.search(platform, f, page=page, limit=50, sort_by=sort_by, sort_order=sort_order)
 
             accounts = result.get("accounts", [])
             if accounts:
@@ -746,15 +610,7 @@ async def find_similar_creators(
         f = coerce_filters(filters)
         f = _map_follower_filter(f, platform)
 
-        body: dict[str, Any] = {
-            "platform": platform,
-            "filter_key": filter_key,
-            "filter_value": filter_value,
-            "paging": {"limit": limit, "page": page},
-        }
-        if f:
-            body["filters"] = f
-        result = await client.post(f"{API_V1}/discovery/creators/similar/", body)
+        result = await client.discovery.similar(platform, filter_key, filter_value, f, page=page, limit=limit)
         return json.dumps(result, indent=2)
     except Exception as e:
         return _error_response(e)
@@ -784,7 +640,7 @@ async def audience_overlap(
         if len(creators) < 2 or len(creators) > 10:
             raise ValueError("Must provide 2-10 creator usernames")
 
-        result = await client.post(f"{API_V1}/creators/audience/overlap/", {"platform": platform, "creators": creators})
+        result = await client.discovery.audience_overlap(platform, creators)
         return json.dumps(result, indent=2)
     except Exception as e:
         return _error_response(e)
@@ -800,7 +656,7 @@ async def audience_overlap(
 async def get_languages() -> str:
     """Get the list of supported language codes for discovery filters. Free (0 credits)."""
     try:
-        result = await client.get(f"{API_V1}/discovery/classifier/languages/")
+        result = await client.discovery.languages()
         return json.dumps(result, indent=2)
     except Exception as e:
         return _error_response(e)
@@ -816,7 +672,7 @@ async def get_locations(
     """Get available location codes for a specific platform's discovery filters. Free (0 credits)."""
     try:
         platform = _validate_platform(platform, DISCOVERY_PLATFORMS)
-        result = await client.get(f"{API_V1}/discovery/classifier/locations/{platform}/")
+        result = await client.discovery.locations(platform)
         return json.dumps(result, indent=2)
     except Exception as e:
         return _error_response(e)
@@ -832,12 +688,7 @@ async def get_brands(
 ) -> str:
     """Get available brand names for discovery filters (Instagram brand deal detection). Supports search and pagination. Free (0 credits)."""
     try:
-        params: dict[str, str] = {}
-        if search:
-            params["search"] = search.strip()
-        if offset is not None:
-            params["offset"] = str(offset)
-        result = await client.get(f"{API_V1}/discovery/classifier/brands/", params or None)
+        result = await client.discovery.brands(search, offset)
         return json.dumps(result, indent=2)
     except Exception as e:
         return _error_response(e)
@@ -850,7 +701,7 @@ async def get_brands(
 async def get_youtube_topics() -> str:
     """Get available YouTube topic categories for discovery filters. Free (0 credits)."""
     try:
-        result = await client.get(f"{API_V1}/discovery/classifier/yt-topics/")
+        result = await client.discovery.youtube_topics()
         return json.dumps(result, indent=2)
     except Exception as e:
         return _error_response(e)
@@ -863,7 +714,7 @@ async def get_youtube_topics() -> str:
 async def get_games() -> str:
     """Get available game names for Twitch discovery filters. Free (0 credits)."""
     try:
-        result = await client.get(f"{API_V1}/discovery/classifier/games/")
+        result = await client.discovery.games()
         return json.dumps(result, indent=2)
     except Exception as e:
         return _error_response(e)
@@ -879,12 +730,7 @@ async def get_audience_brand_categories(
 ) -> str:
     """Search audience brand categories for Instagram audience filters. Supports pagination. Free (0 credits)."""
     try:
-        params: dict[str, str] = {}
-        if search:
-            params["search"] = search.strip()
-        if offset is not None:
-            params["offset"] = str(offset)
-        result = await client.get(f"{API_V1}/discovery/classifier/audience-brand-categories/", params or None)
+        result = await client.discovery.audience_brand_categories(search, offset)
         return json.dumps(result, indent=2)
     except Exception as e:
         return _error_response(e)
@@ -900,12 +746,7 @@ async def get_audience_brand_names(
 ) -> str:
     """Search audience brand names for Instagram audience filters. Supports pagination. Free (0 credits)."""
     try:
-        params: dict[str, str] = {}
-        if search:
-            params["search"] = search.strip()
-        if offset is not None:
-            params["offset"] = str(offset)
-        result = await client.get(f"{API_V1}/discovery/classifier/audience-brand-names/", params or None)
+        result = await client.discovery.audience_brand_names(search, offset)
         return json.dumps(result, indent=2)
     except Exception as e:
         return _error_response(e)
@@ -921,12 +762,7 @@ async def get_audience_interests(
 ) -> str:
     """Search audience interest categories for Instagram audience filters. Supports pagination. Free (0 credits)."""
     try:
-        params: dict[str, str] = {}
-        if search:
-            params["search"] = search.strip()
-        if offset is not None:
-            params["offset"] = str(offset)
-        result = await client.get(f"{API_V1}/discovery/classifier/audience-interests/", params or None)
+        result = await client.discovery.audience_interests(search, offset)
         return json.dumps(result, indent=2)
     except Exception as e:
         return _error_response(e)
@@ -942,12 +778,7 @@ async def get_audience_locations(
 ) -> str:
     """Search audience locations for Instagram audience filters. Supports pagination. Free (0 credits)."""
     try:
-        params: dict[str, str] = {}
-        if search:
-            params["search"] = search.strip()
-        if offset is not None:
-            params["offset"] = str(offset)
-        result = await client.get(f"{API_V1}/discovery/classifier/audience-locations/", params or None)
+        result = await client.discovery.audience_locations(search, offset)
         return json.dumps(result, indent=2)
     except Exception as e:
         return _error_response(e)
@@ -969,7 +800,7 @@ async def connected_socials(
     try:
         platform = _validate_platform(platform, SOCIAL_PLATFORMS)
         handle = _validate_handle(handle)
-        result = await client.post(f"{API_V1}/creators/socials/", {"platform": platform, "handle": handle})
+        result = await client.enrichment.connected_socials(platform, handle)
         return json.dumps(result, indent=2)
     except Exception as e:
         return _error_response(e)
@@ -1009,13 +840,13 @@ async def enrich_by_handle(
         if email_required not in ("must_have", "preferred"):
             raise ValueError("email_required must be 'must_have' or 'preferred'")
 
-        result = await client.post(f"{API_V1}/creators/enrich/handle/full/", {
-            "handle": handle,
-            "platform": platform,
-            "email_required": email_required,
-            "include_lookalikes": include_lookalikes,
-            "include_audience_data": include_audience_data,
-        })
+        result = await client.enrichment.by_handle_full(
+            handle,
+            platform,
+            email_required=email_required,
+            include_lookalikes=include_lookalikes,
+            include_audience_data=include_audience_data,
+        )
         return json.dumps(result, indent=2)
     except Exception as e:
         return _error_response(e)
@@ -1040,7 +871,7 @@ async def enrich_by_handle_raw(
     try:
         platform = _validate_platform(platform, SOCIAL_PLATFORMS)
         handle = _validate_handle(handle)
-        result = await client.post(f"{API_V1}/creators/enrich/handle/raw/", {"handle": handle, "platform": platform})
+        result = await client.enrichment.by_handle_raw(handle, platform)
         return json.dumps(result, indent=2)
     except Exception as e:
         return _error_response(e)
@@ -1062,7 +893,7 @@ async def enrich_by_email(
         email = email.strip().lower()
         if not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", email):
             raise ValueError("Invalid email address format")
-        result = await client.post(f"{API_V1}/creators/enrich/email/", {"email": email})
+        result = await client.enrichment.by_email(email)
         return json.dumps(result, indent=2)
     except Exception as e:
         return _error_response(e)
@@ -1251,20 +1082,15 @@ async def create_batch_enrichment(
         except Exception:
             pass  # don't block submission over a warning
 
-        files = {"file": ("batch.csv", csv_bytes, "text/csv")}
-        data: dict[str, str] = {"enrichment_mode": enrichment_mode}
-        if platform:
-            data["platform"] = platform
-        if email_required:
-            data["email_required"] = email_required
-        if include_lookalikes is not None:
-            data["include_lookalikes"] = str(include_lookalikes).lower()
-        if include_audience_data is not None:
-            data["include_audience_data"] = str(include_audience_data).lower()
-        if metadata:
-            data["metadata"] = json.dumps(metadata) if isinstance(metadata, dict) else str(metadata)
-
-        result = await client.post_multipart(f"{API_V1}/enrichment/batch/", files, data)
+        result = await client.batch.create(
+            csv_bytes,
+            enrichment_mode,
+            platform=platform,
+            email_required=email_required,
+            include_lookalikes=include_lookalikes,
+            include_audience_data=include_audience_data,
+            metadata=metadata,
+        )
         if isinstance(result, dict):
             if duplicate_warning:
                 result["duplicate_warning"] = duplicate_warning
@@ -1328,7 +1154,7 @@ async def get_batch_status(
             if wait_remaining > 0:
                 await asyncio.sleep(wait_remaining)
 
-        result = await client.get(f"{API_V1}/enrichment/batch/{batch_id}/status/")
+        result = await client.batch.status(batch_id)
 
         # Cache with current time AFTER the API call (not before sleep)
         _batch_poll_cache[batch_id] = (time.time(), result)
@@ -1415,9 +1241,7 @@ async def download_batch_results(
             file_path = output_path / f"{base_name}.csv"
 
         # Fetch as JSON from API (CSV format returns 404), then convert to CSV
-        result = await client.get(
-            f"{API_V1}/enrichment/batch/{batch_id}/", {"format": "json"}, timeout=120.0
-        )
+        result = await client.batch.results(batch_id)
 
         # Extract the results list from the API response
         if isinstance(result, list):
@@ -1433,11 +1257,11 @@ async def download_batch_results(
             raw_data = []
 
         # Build preview of top 10 rows for UI display
-        preview = _preview_rows(raw_data) if raw_data else []
+        preview = preview_rows(raw_data) if raw_data else []
         total_records = len(raw_data)
 
         # Convert JSON to CSV
-        csv_text = _json_batch_to_csv(result)
+        csv_text = json_batch_to_csv(result)
 
         # Save to file
         output_path.mkdir(parents=True, exist_ok=True)
@@ -1476,7 +1300,7 @@ async def resume_batch(
         batch_id = batch_id.strip()
         if not batch_id:
             raise ValueError("batch_id is required")
-        result = await client.post(f"{API_V1}/enrichment/batch/{batch_id}/resume/", {})
+        result = await client.batch.resume(batch_id)
         return json.dumps(result, indent=2)
     except Exception as e:
         return _error_response(e)
@@ -1500,12 +1324,7 @@ async def get_creator_posts(
     try:
         platform = _validate_platform(platform, CONTENT_PLATFORMS)
         handle = _validate_handle(handle)
-        body: dict[str, Any] = {"platform": platform, "handle": handle}
-        if count is not None:
-            body["count"] = count
-        if pagination_token:
-            body["pagination_token"] = pagination_token
-        result = await client.post(f"{API_V1}/creators/content/posts/", body)
+        result = await client.content.posts(platform, handle, count=count, pagination_token=pagination_token)
         return json.dumps(result, indent=2)
     except Exception as e:
         return _error_response(e)
@@ -1536,10 +1355,7 @@ async def get_post_details(
         if not post_id:
             raise ValueError("post_id is required")
 
-        body: dict[str, Any] = {"platform": platform, "post_id": post_id, "content_type": content_type}
-        if pagination_token:
-            body["pagination_token"] = pagination_token
-        result = await client.post(f"{API_V1}/creators/content/details/", body)
+        result = await client.content.post_details(platform, post_id, content_type, pagination_token=pagination_token)
         return json.dumps(result, indent=2)
     except Exception as e:
         return _error_response(e)
@@ -1556,7 +1372,7 @@ async def check_credits() -> str:
     """Check your Influencers.club account credit balance and usage. Free (0 credits).
     Use this to verify you have enough credits before expensive operations."""
     try:
-        result = await client.get(f"{API_V1}/accounts/credits/")
+        result = await client.account.credits()
         return json.dumps(result, indent=2)
     except Exception as e:
         return _error_response(e)
