@@ -14,6 +14,7 @@ import pytest
 
 from influencers_club_mcp import server
 from influencers_club_mcp.api_client import ApiError, InfluencersApiClient
+from influencers_club_mcp.api_discovery import DiscoveryApi
 from influencers_club_mcp.api_exclusion_lists import ExclusionListsApi
 from influencers_club_mcp.discovery_filters import coerce_filters
 
@@ -37,13 +38,14 @@ SEARCH = {"total": 0, "limit": 20, "credits_left": "10.00", "accounts": []}
 class FakeClient:
     """Records every request and answers each from a queue of canned API bodies.
 
-    Only the transport is faked: ``exclusion_lists`` is the real endpoint group, so the
-    recorded calls are the requests a tool really makes.
+    Only the transport is faked: ``discovery`` and ``exclusion_lists`` are the real
+    endpoint groups, so the recorded calls are the requests a tool really makes.
     """
 
     def __init__(self, *answers):
         self.answers = list(answers)
         self.calls = []
+        self.discovery = DiscoveryApi(self)
         self.exclusion_lists = ExclusionListsApi(self)
 
     async def _answer(self, method, path, body=None, params=None):
