@@ -24,7 +24,7 @@ The hosted server runs at `https://mcp-dashboard.influencers.club/mcp` and signs
 **Requirements:** an [Influencers Club](https://influencers.club) account with API credits. Discovery and enrichment tools consume credits (costs are listed on every tool and in the tables below); dictionary/lookup tools are free.
 
 **Notes:**
-- The hosted connector exposes the 19 API tools. File and batch tools (CSV export, bulk CSV enrichment) need a local filesystem and are available only in the [local install](#local-install-stdio).
+- The hosted connector exposes the API tools. File and batch tools (CSV export, bulk CSV enrichment) need a local filesystem and are available only in the [local install](#local-install-stdio).
 - **Connection expired / 401 errors:** disconnect and reconnect the connector to re-authenticate.
 - **"Insufficient credits" errors:** top up in the [dashboard](https://dashboard.influencers.club); calls keep failing until the balance is positive.
 
@@ -34,7 +34,7 @@ Influencers Club is an official app in ChatGPT:
 
 1. Open the app: [Influencers Club for ChatGPT](https://chatgpt.com/plugins/plugin_asdk_app_6a7f1d4e9f388191ab1e0f00bf041b2b)
 2. Click **Connect** — you'll be redirected to the Influencers Club dashboard to sign in and approve access.
-3. Done. The same 19 API tools are available; the credit requirements and notes from the claude.ai section apply unchanged.
+3. Done. The same API tools are available; the credit requirements and notes from the claude.ai section apply unchanged.
 
 ### Fallback: Developer Mode
 
@@ -169,9 +169,9 @@ Add to your Claude Desktop `claude_desktop_config.json`:
 
 After configuring, restart your client. The server will appear as "influencers-club".
 
-## Available Tools (29)
+## Available Tools
 
-19 API tools are available everywhere (hosted connector and local). Tools marked **local only** need the local filesystem, so they exist only in stdio installs.
+API tools are available everywhere (hosted connector and local). Tools marked **local only** need the local filesystem, so they exist only in stdio installs.
 
 ### Creator Discovery
 
@@ -181,6 +181,25 @@ After configuring, restart your client. The server will appear as "influencers-c
 | `discover_creators_to_file` *(local only)* | Multi-page discovery with CSV export to disk | 0.01/creator |
 | `find_similar_creators` | Find creators similar to a seed creator | 0.01/creator |
 | `audience_overlap` | Compare audience overlap between 2-10 creators | 1 credit |
+
+### Exclusion Lists
+
+Team-shared blocklists of creator handles: one default list per platform plus any specific lists you create. A list filters a search only when passed in `filters` — `exclude_list: [ids]`, `exclude_default_list: true` or `exclude_all_lists: true`. List ids are checked before a search; if they are not this platform's, or cannot be checked, the search is not run.
+
+| Tool | Description | Cost |
+|---|---|---|
+| `list_exclusion_lists` | List the team's exclusion lists, optionally for one platform | free |
+| `create_exclusion_list` | Create a specific list for a platform | free |
+| `get_exclusion_list` | Get one specific list by id | free |
+| `rename_exclusion_list` | Rename a specific list | free |
+| `delete_exclusion_list` | Delete a specific list and its handles | free |
+| `get_exclusion_list_handles` | Page through a specific list's handles | free |
+| `add_to_exclusion_list` | Add handles to a specific list | free |
+| `remove_from_exclusion_list` | Remove handles from a specific list | free |
+| `get_default_exclusion_list` | Get a platform's default list | free |
+| `get_default_exclusion_list_handles` | Page through a platform's default list | free |
+| `add_to_default_exclusion_list` | Add handles to a platform's default list | free |
+| `remove_from_default_exclusion_list` | Remove handles from a platform's default list | free |
 
 ### Enrichment
 
@@ -266,6 +285,7 @@ After configuring, restart your client. The server will appear as "influencers-c
 |---|---|
 | Enrichment | Instagram, TikTok, YouTube, OnlyFans, X/Twitter, Twitch, LinkedIn (raw mode only) |
 | Discovery | Instagram, TikTok, YouTube, OnlyFans, X/Twitter, Twitch |
+| Exclusion lists | Instagram, TikTok, YouTube, OnlyFans, X/Twitter, Twitch |
 | Content Data | Instagram, TikTok, YouTube |
 | Audience Overlap | Instagram, TikTok, YouTube |
 

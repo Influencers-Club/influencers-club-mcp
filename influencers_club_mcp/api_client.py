@@ -4,8 +4,9 @@ Handles authentication, rate limiting, timeouts, error normalization,
 credential redaction, and debug logging to stderr.
 
 The endpoints of each API area live in their own module (api_discovery.py,
-api_enrichment.py, api_batch.py, api_content.py, api_account.py) and hang off
-the client: ``client.discovery.search(...)``, ``client.account.credits()``.
+api_enrichment.py, api_batch.py, api_content.py, api_account.py,
+api_exclusion_lists.py) and hang off the client:
+``client.discovery.search(...)``, ``client.account.credits()``.
 """
 
 import json
@@ -23,6 +24,7 @@ from .api_batch import BatchApi
 from .api_content import ContentApi
 from .api_discovery import DiscoveryApi
 from .api_enrichment import EnrichmentApi
+from .api_exclusion_lists import ExclusionListsApi
 from .auth import invalidate_cached_token
 from .oauth_config import load_oauth_config
 
@@ -43,6 +45,19 @@ def _sanitize(text: str) -> str:
 
 
 logger = logging.getLogger(__name__)
+
+
+def _flatten_error(value: Any) -> str:
+    """One readable line from a DRF error value.
+
+    Non-field errors arrive as a list of strings, field errors as
+    {"name": ["This field is required."]}, possibly nested per filter.
+    """
+    if isinstance(value, list):
+        return "; ".join(_flatten_error(v) for v in value)
+    if isinstance(value, dict):
+        return "; ".join(f"{k}: {_flatten_error(v)}" for k, v in value.items())
+    return str(value)
 
 
 class RateLimitError(Exception):
@@ -136,6 +151,7 @@ class InfluencersApiClient:
         self.batch = BatchApi(self)
         self.content = ContentApi(self)
         self.account = AccountApi(self)
+        self.exclusion_lists = ExclusionListsApi(self)
 
     async def _resolve_token(self) -> str:
         """Resolve the bearer token to send to the dashboard API.
@@ -283,6 +299,8 @@ class InfluencersApiClient:
                 if isinstance(body, dict):
                     msg = (body.get("message") or body.get("detail") or body.get("error")
                            or body.get("response_meta", {}).get("error_message"))
+                if isinstance(msg, (list, dict)):
+                    msg = _flatten_error(msg)
                 if not msg:
                     # No recognized message key (e.g. DRF field-error dicts like
                     # {"filters": {"engagement_percent": [...]}} or list bodies) —
@@ -321,23 +339,39 @@ class InfluencersApiClient:
         except Exception as e:
             raise self._handle_error(e) from e
 
-    async def post(self, path: str, body: dict[str, Any], timeout: float = DEFAULT_TIMEOUT) -> Any:
-        """Make a POST request with JSON body."""
-        logger.info("POST %s", path)
+    async def _send_json(
+        self, method: str, path: str, body: dict[str, Any] | None, timeout: float
+    ) -> Any:
+        """Send a request with an optional JSON body. A 204 (no content) yields None."""
+        logger.info("%s %s", method, path)
         client = await self._get_client()
         try:
             self._rate_limiter.check()
-            resp = await client.post(
-                path,
-                json=body,
-                headers={**(await self._headers()), "Content-Type": "application/json"},
-                timeout=timeout,
-            )
-            logger.info("POST %s -> %s", path, resp.status_code)
+            headers = await self._headers()
+            if body is not None:
+                headers["Content-Type"] = "application/json"
+            resp = await client.request(method, path, json=body, headers=headers, timeout=timeout)
+            logger.info("%s %s -> %s", method, path, resp.status_code)
             resp.raise_for_status()
+            if resp.status_code == 204:
+                return None
             return resp.json()
         except Exception as e:
             raise self._handle_error(e) from e
+
+    async def post(self, path: str, body: dict[str, Any], timeout: float = DEFAULT_TIMEOUT) -> Any:
+        """Make a POST request with JSON body."""
+        return await self._send_json("POST", path, body, timeout)
+
+    async def patch(self, path: str, body: dict[str, Any], timeout: float = DEFAULT_TIMEOUT) -> Any:
+        """Make a PATCH request with JSON body."""
+        return await self._send_json("PATCH", path, body, timeout)
+
+    async def delete(
+        self, path: str, body: dict[str, Any] | None = None, timeout: float = DEFAULT_TIMEOUT
+    ) -> Any:
+        """Make a DELETE request, with a JSON body where the endpoint takes one."""
+        return await self._send_json("DELETE", path, body, timeout)
 
     async def post_multipart(
         self, path: str, files: dict, data: dict[str, str], timeout: float = BATCH_TIMEOUT
