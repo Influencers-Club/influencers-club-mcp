@@ -24,7 +24,7 @@ The hosted server runs at `https://mcp-dashboard.influencers.club/mcp` and signs
 **Requirements:** an [Influencers Club](https://influencers.club) account with API credits. Discovery and enrichment tools consume credits (costs are listed on every tool and in the tables below); dictionary/lookup tools are free.
 
 **Notes:**
-- The hosted connector exposes the 19 API tools. File and batch tools (CSV export, bulk CSV enrichment) need a local filesystem and are available only in the [local install](#local-install-stdio).
+- The hosted connector exposes the API tools. File and batch tools (CSV export, bulk CSV enrichment) need a local filesystem and are available only in the [local install](#local-install-stdio).
 - **Connection expired / 401 errors:** disconnect and reconnect the connector to re-authenticate.
 - **"Insufficient credits" errors:** top up in the [dashboard](https://dashboard.influencers.club); calls keep failing until the balance is positive.
 
@@ -34,7 +34,7 @@ Influencers Club is an official app in ChatGPT:
 
 1. Open the app: [Influencers Club for ChatGPT](https://chatgpt.com/plugins/plugin_asdk_app_6a7f1d4e9f388191ab1e0f00bf041b2b)
 2. Click **Connect** — you'll be redirected to the Influencers Club dashboard to sign in and approve access.
-3. Done. The same 19 API tools are available; the credit requirements and notes from the claude.ai section apply unchanged.
+3. Done. The same API tools are available; the credit requirements and notes from the claude.ai section apply unchanged.
 
 ### Fallback: Developer Mode
 
@@ -169,9 +169,9 @@ Add to your Claude Desktop `claude_desktop_config.json`:
 
 After configuring, restart your client. The server will appear as "influencers-club".
 
-## Available Tools (41)
+## Available Tools
 
-31 API tools are available everywhere (hosted connector and local). Tools marked **local only** need the local filesystem, so they exist only in stdio installs.
+API tools are available everywhere (hosted connector and local). Tools marked **local only** need the local filesystem, so they exist only in stdio installs.
 
 ### Creator Discovery
 

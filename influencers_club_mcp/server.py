@@ -696,7 +696,7 @@ async def find_similar_creators(
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# 2b. EXCLUSION LISTS
+# EXCLUSION LISTS
 # ═══════════════════════════════════════════════════════════════════════
 # Team-shared, per-platform blocklists of creator handles. One tool per API operation:
 # a specific list is addressed by list_id, a platform's default list by platform.
