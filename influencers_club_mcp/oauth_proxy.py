@@ -3,17 +3,13 @@
 The hosted server serves its own authorization-server metadata and forwards the OAuth
 protocol messages to the dashboard, the real authorization server, which runs consent
 and mints and validates every token. Two things some clients get wrong would each
-leave the user holding a token this server cannot use, so the proxy fills them in and
-forwards everything else as sent.
+leave the user holding a token this server cannot use, so the proxy fills them in.
 """
 
-import json
 import logging
-import re
-from urllib.parse import parse_qsl, urlencode
+from collections.abc import Mapping
 
 import httpx
-from starlette.requests import Request
 from starlette.responses import Response
 
 from .api_client import _sanitize
@@ -21,19 +17,24 @@ from .api_client import _sanitize
 logger = logging.getLogger(__name__)
 
 
-def map_openid_scope(scope: str) -> str:
-    """``all`` when ``openid`` is among the requested scopes, otherwise ``scope`` as sent.
+def map_openid_scope(params: dict, endpoint: str) -> dict:
+    """``params`` with scope ``all`` when the requested scope includes ``openid``.
 
     Some clients request ``openid`` by default. This server implements no OpenID
     Connect, and the dashboard drops scopes it doesn't know, so such a client would
-    get a token with no scope, which every API call refuses. Only ``openid`` is
-    special: a request whose scopes are all unsupported is forwarded unchanged.
+    get a token with no scope, which every API call refuses. Registration needs it
+    too: the dashboard caps a client's scopes at the ones it registered with. Only
+    ``openid`` is special: scopes that are all unsupported are returned unchanged.
     """
-    return "all" if "openid" in scope.split() else scope
+    scope = params.get("scope")
+    if isinstance(scope, str) and "openid" in scope.split():
+        logger.info("oauth-proxy %s: mapped scope openid to all", endpoint)
+        return {**params, "scope": "all"}
+    return params
 
 
-def authorize_query(query: str, resource: str) -> str:
-    """The authorize query to forward, unchanged unless it lacks ``resource`` or asks for ``openid``.
+def authorize_params(params: Mapping[str, str], resource: str) -> dict:
+    """The authorize parameters to forward: ``openid`` mapped, a missing ``resource`` defaulted.
 
     The MCP authorization spec requires clients to send ``resource`` (RFC 8707). The
     dashboard binds the token to it, and introspection reports only tokens bound to
@@ -42,53 +43,21 @@ def authorize_query(query: str, resource: str) -> str:
     server is the resource it wants; RFC 8707 section 2.1 lets an authorization server
     apply such a default. A blank ``resource`` counts as missing.
     """
-    params = parse_qsl(query, keep_blank_values=True)
-    has_resource = any(name == "resource" and value for name, value in params)
-    maps_scope = any(
-        name == "scope" and map_openid_scope(value) != value for name, value in params
+    params = map_openid_scope(dict(params), "/authorize")
+    if params.get("resource"):
+        return params
+    logger.info(
+        "oauth-proxy /authorize: defaulted resource for client_id=%s", params.get("client_id", "?")
     )
-    if has_resource and not maps_scope:
-        return query
-    params = [
-        (name, map_openid_scope(value) if name == "scope" else value)
-        for name, value in params
-        if name != "resource" or value
-    ]
-    if not has_resource:
-        params.append(("resource", resource))
-    return urlencode(params)
-
-
-def register_body(body: bytes) -> bytes:
-    """The client-registration request to forward, with ``openid`` mapped in its scope.
-
-    The dashboard caps a client's scopes at the scope it registered with, so a client
-    registered with ``openid`` could never be granted ``all``, whatever it later asks
-    for at /authorize. Anything other than a JSON object with a string ``scope`` is
-    forwarded as sent, for the dashboard to judge.
-    """
-    try:
-        data = json.loads(body)
-    except ValueError:
-        return body
-    if not isinstance(data, dict) or not isinstance(data.get("scope"), str):
-        return body
-    scope = map_openid_scope(data["scope"])
-    if scope == data["scope"]:
-        return body
-    return json.dumps({**data, "scope": scope}).encode()
+    return {**params, "resource": resource}
 
 
 async def proxy_post(
-    request: Request, dashboard: str, path: str, body: bytes | None = None
+    dashboard: str, path: str, *, json: dict | None = None, data: dict | None = None
 ) -> Response:
-    """POST ``body`` (default: the request's own body) to ``dashboard + path`` and return
-    the dashboard's answer unchanged."""
-    if body is None:
-        body = await request.body()
-    ct = request.headers.get("content-type", "application/x-www-form-urlencoded")
+    """POST a JSON or form body to ``dashboard + path`` and return the dashboard's answer unchanged."""
     async with httpx.AsyncClient(timeout=30.0) as http:
-        r = await http.post(f"{dashboard}{path}", content=body, headers={"Content-Type": ct})
+        r = await http.post(f"{dashboard}{path}", json=json, data=data)
     if 400 <= r.status_code < 500:
         # Claude's own grants come through here, and a rejection is returned to it
         # verbatim with no record of why — the dashboard signals invalid_grant vs
@@ -97,11 +66,10 @@ async def proxy_post(
         # 4xx only: a 5xx on a DEBUG=True env renders a traceback whose locals hold
         # credentials. The REQUEST body is never logged — it carries the refresh
         # token, the auth code and the PKCE verifier.
-        grant = re.search(rb"grant_type=([A-Za-z0-9_.:%-]+)", body)
         logger.warning(
             "oauth-proxy %s grant=%s -> %s: %s",
             path,
-            grant.group(1).decode() if grant else "?",
+            (data or {}).get("grant_type", "?"),
             r.status_code,
             _sanitize(r.text[:300]),
         )

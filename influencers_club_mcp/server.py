@@ -234,11 +234,13 @@ if HTTP_MODE:
     # validates every token; the MCP forwards the OAuth protocol messages, filling in
     # what some clients leave out (see oauth_proxy.py), and never passes a token
     # through, so it stays a plain resource server.
+    import httpx
+
     from urllib.parse import urlsplit as _urlsplit
     from starlette.responses import RedirectResponse, Response
 
     from .oauth_config import load_oauth_config as _load_oauth_config
-    from .oauth_proxy import authorize_query, proxy_post, register_body
+    from .oauth_proxy import authorize_params, map_openid_scope, proxy_post
 
     _oauth = _load_oauth_config()
     _DASH = _oauth.api_base.rstrip("/")
@@ -269,29 +271,26 @@ if HTTP_MODE:
     async def oauth_authorize(request: Request) -> RedirectResponse:
         # Browser-facing: hand off to the dashboard's real authorize endpoint,
         # preserving client_id / PKCE / redirect_uri / state / resource, with the
-        # fallbacks in authorize_query.
-        target = f"{_DASH}/public/v1/oauth/authorize/"
-        query = authorize_query(request.url.query, _oauth.resource)
-        if query != request.url.query:
-            logger.info(
-                "oauth-proxy /authorize: filled in resource/scope for client_id=%s",
-                request.query_params.get("client_id", "?"),
-            )
-        if query:
-            target = f"{target}?{query}"
-        return RedirectResponse(url=target, status_code=302)
+        # fallbacks in authorize_params.
+        params = authorize_params(request.query_params, _oauth.resource)
+        target = httpx.URL(f"{_DASH}/public/v1/oauth/authorize/", params=params)
+        return RedirectResponse(url=str(target), status_code=302)
 
     @mcp.custom_route("/token", methods=["POST"])
     async def oauth_token(request: Request) -> Response:
-        return await proxy_post(request, _DASH, "/public/v1/oauth/token/")
+        form = dict(await request.form())
+        return await proxy_post(_DASH, "/public/v1/oauth/token/", data=form)
 
     @mcp.custom_route("/register", methods=["POST"])
     async def oauth_register(request: Request) -> Response:
-        sent = await request.body()
-        body = register_body(sent)
-        if body != sent:
-            logger.info("oauth-proxy /register: mapped scope openid to all")
-        return await proxy_post(request, _DASH, "/public/v1/oauth/register/", body)
+        try:
+            client = await request.json()
+        except ValueError:
+            client = None
+        if not isinstance(client, dict):
+            return JSONResponse({"error": "invalid_client_metadata"}, status_code=400)
+        client = map_openid_scope(client, "/register")
+        return await proxy_post(_DASH, "/public/v1/oauth/register/", json=client)
 
 
 def _request_token() -> str | None:
