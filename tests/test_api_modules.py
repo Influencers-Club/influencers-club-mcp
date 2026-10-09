@@ -107,6 +107,16 @@ def test_enrichment():
         None,
     )
     t.calls.clear()
+    assert sent(api.by_handle_profile("nike", "linkedin", email_required="must_have"), t) == (
+        "POST", f"{V1}/creators/enrich/handle/profile/", None,
+        {"handle": "nike", "platform": "linkedin", "email_required": "must_have"}, None,
+    )
+    t.calls.clear()
+    assert sent(api.by_handle_analytics("nike", "tiktok", include_lookalikes=False), t) == (
+        "POST", f"{V1}/creators/enrich/handle/analytics/", None,
+        {"handle": "nike", "platform": "tiktok", "include_lookalikes": False}, None,
+    )
+    t.calls.clear()
     assert sent(api.by_handle_raw("nike", "linkedin"), t) == (
         "POST", f"{V1}/creators/enrich/handle/raw/", None, {"handle": "nike", "platform": "linkedin"}, None
     )
@@ -308,7 +318,7 @@ def test_tools_send_through_the_endpoint_groups(monkeypatch):
     assert by_path[f"{V1}/creators/socials/"][3] == {"platform": "instagram", "handle": "nike"}
     assert by_path[f"{V1}/creators/enrich/handle/full/"][3] == {
         "handle": "nike", "platform": "instagram", "email_required": "must_have",
-        "include_lookalikes": False, "include_audience_data": True,
+        "include_lookalikes": True, "include_audience_data": True,
     }
     assert by_path[f"{V1}/creators/enrich/email/"][3] == {"email": "a@b.co"}
     assert by_path[f"{V1}/creators/content/details/"][3] == {
