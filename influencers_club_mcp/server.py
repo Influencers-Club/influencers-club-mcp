@@ -20,20 +20,29 @@ from mcp.server.auth.middleware.bearer_auth import AuthenticatedUser
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.server import TransportSecuritySettings
 from mcp.server.lowlevel.server import request_ctx
-from pydantic import Field
+from pydantic import BeforeValidator, Field
 
 from .api_client import ApiError, InfluencersApiClient
 from .auth import IntrospectionUnavailableMiddleware
-from .csv_export import creators_to_csv
+from .csv_export import creators_to_csv, json_batch_to_csv, preview_rows
 from .csv_import import count_csv_rows, mostly_emails, to_single_column
 from .discovery_filters import DiscoveryFilters, coerce_filters
+from .enrich_results import (
+    ENRICH_ANALYTICS_SECTIONS,
+    ENRICH_SECTIONS,
+    AnalyticsSection,
+    Detail,
+    EnrichSection,
+    shape_profile,
+    shape_result,
+    validate_detail,
+    validate_sections,
+)
 from .log_config import configure_logging
 
 logger = logging.getLogger(__name__)
 
 # ─── Constants ─────────────────────────────────────────────────────────
-API_V1 = "/public/v1"
-
 def _is_docker() -> bool:
     """Detect if running inside a Docker container."""
     return os.path.exists("/.dockerenv") or os.path.exists("/run/.containerenv")
@@ -83,6 +92,10 @@ SOCIAL_PLATFORMS = (
 )
 # Full enrichment intentionally steers linkedin to the cheaper raw endpoint.
 ENRICH_FULL_PLATFORMS = tuple(p for p in SOCIAL_PLATFORMS if p != "linkedin")
+# The analytics tier carries no data for the scraper-only platforms and rejects
+# them with a 400. Spelled out rather than aliased to DISCOVERY_PLATFORMS: the
+# members match today but the two answer different questions and would drift.
+ENRICH_ANALYTICS_PLATFORMS = ("instagram", "youtube", "tiktok", "twitch", "twitter", "onlyfans")
 VALID_SORT_BY = ("relevancy", "engagement_rate", "number_of_followers", "growth_rate")
 
 # Rejected rather than silently ignored: neither ever filtered anything, so
@@ -104,6 +117,12 @@ CREDIT_COSTS = {
     "handle_raw": 0.03, "handle_full": 1, "email_basic": 0.05,
     "posts": 0.15, "post_detail": 0.03,
 }
+
+# Claude Code parks a tool result over ~25k tokens in a file instead of showing
+# it to the model; a tool can raise its own ceiling to this hard maximum. The
+# compacted enrichment results reach ~21k tokens on the largest creators, and
+# detail="full" or "raw" go over 25k.
+_LARGE_RESULT_META = {"anthropic/maxResultSizeChars": 500_000}
 
 # ─── Initialize ────────────────────────────────────────────────────────
 # Logging first: build_auth() below already logs, and FastMCP() only installs
@@ -182,7 +201,14 @@ _INSTRUCTIONS_CORE = (
     "Credits: every discovery/enrichment result costs credits (amounts are stated on each tool). "
     "The limit parameter controls spend — it defaults to the requested amount, max 50 per request.\n\n"
     "discover_creators: 'ai_search' does semantic niche/topic search and works best with the user's "
-    "own words. 'hashtags' and 'keywords_in_bio' are separate, literal filters.\n"
+    "own words. 'hashtags' and 'keywords_in_bio' are separate, literal filters.\n\n"
+    "Exclusion lists: team-shared, per-platform blocklists of creator handles (free, no credits). "
+    "Specific lists are addressed by id (list_exclusion_lists, create_exclusion_list, get_exclusion_list, "
+    "rename_exclusion_list, delete_exclusion_list, get_exclusion_list_handles, add_to_exclusion_list, "
+    "remove_from_exclusion_list); each platform also has one default list addressed by platform "
+    "(get_default_exclusion_list, get_default_exclusion_list_handles, add_to_default_exclusion_list, "
+    "remove_from_default_exclusion_list). A list only affects a search when the discover_creators or "
+    "find_similar_creators filters carry exclude_list (ids), exclude_default_list or exclude_all_lists.\n"
 )
 
 _INSTRUCTIONS_STDIO_EXTRAS = (
@@ -201,6 +227,13 @@ class _FastMCP(FastMCP):
     to every verifier failure. IntrospectionUnavailableMiddleware has to sit outside
     that stack, so it is added here, on the app the SDK hands back.
     """
+
+    def tool(self, *args, structured_output: bool | None = False, **kwargs):
+        # Every tool returns a JSON string. Left to infer, the SDK wraps it a second
+        # time as structuredContent {"result": text}, and Claude Code shows the model
+        # that form: the same JSON escaped inside a string (+12% characters, measured
+        # on an analytics result) and every result sent twice on the wire.
+        return super().tool(*args, structured_output=structured_output, **kwargs)
 
     def streamable_http_app(self):
         app = super().streamable_http_app()
@@ -417,127 +450,88 @@ def _validate_handle(handle: str) -> str:
     return h
 
 
-
-def _flatten(obj: Any, prefix: str = "") -> dict[str, str]:
-    """Flatten a nested dict into dot-separated keys for CSV columns."""
-    out: dict[str, str] = {}
-    if isinstance(obj, dict):
-        for k, v in obj.items():
-            key = f"{prefix}{k}" if not prefix else f"{prefix}.{k}"
-            if isinstance(v, dict):
-                out.update(_flatten(v, key))
-            elif isinstance(v, (list, tuple)):
-                out[key] = json.dumps(v) if v else ""
-            else:
-                out[key] = "" if v is None else str(v)
-    return out
+def _dump_json(obj: Any) -> str:
+    """Compact JSON with non-ASCII text as it is, so a large result spends its characters
+    on data rather than on indentation and escape sequences (escaped, a 120-character
+    caption in another script runs to 700)."""
+    text = json.dumps(obj, separators=(",", ":"), ensure_ascii=False)
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        # A lone UTF-16 surrogate in the API's text (a caption cut mid-emoji upstream)
+        # cannot travel as UTF-8; escaped JSON carries it, as every result used to go.
+        text = json.dumps(obj, separators=(",", ":"))
+    return text
 
 
-def _preview_rows(data: list[dict], max_rows: int = 5) -> list[dict[str, str]]:
-    """Build a preview of the first N rows with key columns for UI display.
+_MAX_IDS_IN_ERROR = 10
 
-    Dynamically selects platform-specific columns based on what's actually
-    present in the data, so previews work for any enrichment mode/platform.
+
+def _validate_handles(handles: list[str]) -> list[str]:
+    """Strip and drop blank entries. No length cap: an entry may be a full profile URL,
+    and the API lowercases, strips '@' and reduces URLs to the handle itself."""
+    cleaned = [h.strip() for h in handles if h and h.strip()]
+    if not cleaned:
+        raise ValueError("handles must contain at least one non-empty handle")
+    return cleaned
+
+
+def _validate_list_name(name: str) -> str:
+    """Strip an exclusion-list name and reject a blank one."""
+    name = name.strip()
+    if not name:
+        raise ValueError("name must not be blank")
+    return name
+
+
+async def _check_exclusion_lists(filters: dict, platform: str) -> None:
+    """Fail before a search when filters.exclude_list names lists that would not apply.
+
+    The API drops ids that are not the team's or not for the searched platform without
+    an error — it notes them only in response_meta, which the public response strips —
+    so the search would run unfiltered and still cost credits. One free GET of the
+    team's lists catches that first. When that lookup itself fails the search is not
+    run either: unverified ids could mean paying for unfiltered results.
     """
-    # Always-show columns first, then platform-specific candidates in priority order
-    always_keys = ["handle"]
-    # Keys from email enrichment results (enrich_by_email / basic mode)
-    email_keys = ["platform", "username", "fullname", "followers"]
-    common_keys = ["first_name", "gender", "location", "is_creator", "has_brand_deals"]
-    platform_keys_by_prefix = {
-        "instagram": ["instagram.username", "instagram.follower_count", "instagram.engagement_percent"],
-        "tiktok": ["tiktok.username", "tiktok.follower_count", "tiktok.engagement_percent"],
-        "youtube": ["youtube.username", "youtube.subscriber_count", "youtube.engagement_percent"],
-        "twitter": ["twitter.username", "twitter.follower_count"],
-        "twitch": ["twitch.username", "twitch.follower_count"],
-    }
+    ids = filters.get("exclude_list") or []
+    # With exclude_all_lists the API applies every list for the platform, whatever the ids say.
+    if not ids or filters.get("exclude_all_lists"):
+        return
+    try:
+        lists = await client.exclusion_lists.list_all()
+    except ApiError as e:
+        logger.warning("exclude_list not verified, search not run: lists lookup failed with %s", e.status)
+        raise
+    if not isinstance(lists, list) or not all(isinstance(item, dict) and "id" in item for item in lists):
+        logger.warning("exclude_list not verified, search not run: unreadable lists response")
+        raise ValueError(
+            "exclude_list could not be verified (your exclusion lists could not be read), so the search "
+            "was not run: the API ignores ids that are not this platform's without notice. Try again."
+        )
+    by_id = {item["id"]: item for item in lists}
+    unknown = sorted({i for i in ids if i not in by_id})
+    wrong_platform = sorted({i for i in ids if i in by_id and by_id[i].get("platform") != platform})
+    def more(found: list) -> str:
+        # Name a few; a caller can send any number of ids.
+        extra = len(found) - _MAX_IDS_IN_ERROR
+        return f" and {extra} more" if extra > 0 else ""
 
-    # Filter out not_found / failed rows — only show successful results in preview
-    data = [item for item in data if item.get("status") != "not_found" and item.get("status") != "failed"]
+    problems = []
+    if unknown:
+        problems.append(f"not found in your team: {unknown[:_MAX_IDS_IN_ERROR]}{more(unknown)}")
+    if wrong_platform:
+        problems.append(
+            f"not {platform} lists: "
+            + ", ".join(f"{i} ({by_id[i].get('platform')})" for i in wrong_platform[:_MAX_IDS_IN_ERROR])
+            + more(wrong_platform)
+        )
+    if problems:
+        raise ValueError(
+            "exclude_list names exclusion lists the API would ignore — "
+            + "; ".join(problems)
+            + ". Use list_exclusion_lists to find ids for this platform."
+        )
 
-    # Flatten a sample of rows to discover which keys exist
-    sample_flats = []
-    for item in data[:max_rows]:
-        flat: dict[str, str] = {}
-        for k, v in item.items():
-            if k in ("result", "enrichment_data") and isinstance(v, dict):
-                flat.update(_flatten(v))
-            elif isinstance(v, dict):
-                flat.update(_flatten(v, k))
-            elif isinstance(v, (list, tuple)):
-                flat[k] = json.dumps(v) if v else ""
-            else:
-                flat[k] = "" if v is None else str(v)
-        if "handle" not in flat and "input_value" in flat:
-            flat["handle"] = flat.pop("input_value")
-        elif "handle" in flat and "input_value" in flat:
-            flat.pop("input_value")
-        sample_flats.append(flat)
-
-    # Detect which platform columns are present
-    all_sample_keys = set()
-    for f in sample_flats:
-        all_sample_keys.update(f.keys())
-
-    platform_cols: list[str] = []
-    for prefix, cols in platform_keys_by_prefix.items():
-        if any(k in all_sample_keys for k in cols):
-            platform_cols.extend(c for c in cols if c in all_sample_keys)
-
-    preview_keys = always_keys + [k for k in email_keys if k in all_sample_keys] + [k for k in common_keys if k in all_sample_keys] + platform_cols
-
-    rows = []
-    for flat in sample_flats:
-        row = {k: flat[k] for k in preview_keys if k in flat}
-        rows.append(row)
-    return rows
-
-
-def _json_batch_to_csv(data: Any) -> str:
-    """Convert batch JSON response (list of objects) to CSV string."""
-    import csv
-    import io
-
-    if isinstance(data, dict):
-        # Sometimes API wraps in a dict
-        data = data.get("results", data.get("data", [data]))
-    if not isinstance(data, list) or not data:
-        return ""
-
-    # Flatten all rows and collect all column names
-    rows: list[dict[str, str]] = []
-    all_keys: list[str] = []
-    seen_keys: set[str] = set()
-
-    for item in data:
-        flat: dict[str, str] = {}
-        # Flatten all top-level fields (input_value, status, handle, email, etc.)
-        for k, v in item.items():
-            if k in ("result", "enrichment_data") and isinstance(v, dict):
-                # Promote result / enrichment_data contents to top-level (no prefix)
-                flat.update(_flatten(v))
-            elif isinstance(v, dict):
-                flat.update(_flatten(v, k))
-            elif isinstance(v, (list, tuple)):
-                flat[k] = json.dumps(v) if v else ""
-            else:
-                flat[k] = "" if v is None else str(v)
-        # Ensure handle column: use input_value as fallback
-        if "handle" not in flat and "input_value" in flat:
-            flat["handle"] = flat.pop("input_value")
-        elif "handle" in flat and "input_value" in flat:
-            flat.pop("input_value")  # avoid duplicate
-        rows.append(flat)
-        for k in flat:
-            if k not in seen_keys:
-                seen_keys.add(k)
-                all_keys.append(k)
-
-    buf = io.StringIO()
-    writer = csv.DictWriter(buf, fieldnames=all_keys, extrasaction="ignore")
-    writer.writeheader()
-    writer.writerows(rows)
-    return buf.getvalue()
 
 
 def _error_response(e: Exception) -> str:
@@ -585,19 +579,14 @@ async def discover_creators(
         _validate_sort(sort_by, sort_order, platform)
         f = coerce_filters(filters)
         f = _map_follower_filter(f, platform)
+        await _check_exclusion_lists(f, platform)
         # ai_search may arrive top-level (preferred) or inside filters; top-level wins.
         ai_search = ai_search or f.pop("ai_search", None)
         if ai_search:
             ai_search = _validate_ai_search(ai_search)
             f["ai_search"] = ai_search
 
-        body = {
-            "platform": platform,
-            "paging": {"limit": limit, "page": page},
-            "sort": {"sort_by": sort_by, "sort_order": sort_order},
-            "filters": f if f else None,
-        }
-        result = await client.post(f"{API_V1}/discovery/", body)
+        result = await client.discovery.search(platform, f, page=page, limit=limit, sort_by=sort_by, sort_order=sort_order)
         return json.dumps(result, indent=2)
     except Exception as e:
         return _error_response(e)
@@ -629,6 +618,7 @@ async def discover_creators_to_file(
         total_pages = min(pages, MAX_EXPORT_PAGES)
         f = coerce_filters(filters)
         f = _map_follower_filter(f, platform)
+        await _check_exclusion_lists(f, platform)
 
         ai_search = ai_search or f.pop("ai_search", None)
         if ai_search:
@@ -644,13 +634,7 @@ async def discover_creators_to_file(
         total_available = 0
 
         for page in range(0, total_pages):
-            body = {
-                "platform": platform,
-                "paging": {"limit": 50, "page": page},
-                "sort": {"sort_by": sort_by, "sort_order": sort_order},
-                "filters": f if f else None,
-            }
-            result = await client.post(f"{API_V1}/discovery/", body)
+            result = await client.discovery.search(platform, f, page=page, limit=50, sort_by=sort_by, sort_order=sort_order)
 
             accounts = result.get("accounts", [])
             if accounts:
@@ -728,16 +712,250 @@ async def find_similar_creators(
         filter_value = _validate_handle(filter_value)
         f = coerce_filters(filters)
         f = _map_follower_filter(f, platform)
+        await _check_exclusion_lists(f, platform)
 
-        body: dict[str, Any] = {
-            "platform": platform,
-            "filter_key": filter_key,
-            "filter_value": filter_value,
-            "paging": {"limit": limit, "page": page},
-        }
-        if f:
-            body["filters"] = f
-        result = await client.post(f"{API_V1}/discovery/creators/similar/", body)
+        result = await client.discovery.similar(platform, filter_key, filter_value, f, page=page, limit=limit)
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        return _error_response(e)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# EXCLUSION LISTS
+# ═══════════════════════════════════════════════════════════════════════
+# Team-shared, per-platform blocklists of creator handles. One tool per API operation:
+# a specific list is addressed by list_id, a platform's default list by platform.
+# The API calls live in api_exclusion_lists.py, reached as client.exclusion_lists; a
+# tool checks its input, hands over, and returns the answer as is — a list object is
+# {id, name, platform, is_default, handle_count, created_at, updated_at}, a handles
+# page is {total, offset, limit, handles}. Only delete_exclusion_list builds its own
+# answer, because the API's is an empty 204. Every call is free.
+_PLATFORMS_DESC = ", ".join(DISCOVERY_PLATFORMS)
+_LIST_ID_DESC = "ID of a specific exclusion list (from list_exclusion_lists)"
+_DEFAULT_PLATFORM_DESC = f"Platform whose default exclusion list to use ({_PLATFORMS_DESC})"
+_ADD_HANDLES_DESC = (
+    "Creator handles or profile URLs to add. The API normalizes them: lowercased, '@' stripped, "
+    "URLs reduced to the handle."
+)
+_REMOVE_HANDLES_DESC = "Creator handles or profile URLs to remove, normalized the same way as when added"
+_OFFSET_DESC = "Handles to skip, for paging"
+_LIMIT_DESC = "Handles per page (1-2000)"
+
+
+@mcp.tool(
+    name="list_exclusion_lists",
+    annotations={"title": "List Exclusion Lists", "readOnlyHint": True, "destructiveHint": False, "openWorldHint": True},
+)
+async def list_exclusion_lists(
+    platform: Annotated[Optional[str], Field(description=f"Only lists for this platform ({_PLATFORMS_DESC}). Omit for every platform.")] = None,
+) -> str:
+    """List the team's exclusion lists: id, name, platform, is_default, handle_count, created_at, updated_at.
+    Free. Handles are not included — use get_exclusion_list_handles. A platform's default list shows up
+    once it has been used; the *_default_exclusion_list tools address it by platform, no id needed.
+    A list only filters a search when passed in discover_creators / find_similar_creators filters
+    (exclude_list=[ids], exclude_default_list=true or exclude_all_lists=true)."""
+    try:
+        wanted = _validate_platform(platform, DISCOVERY_PLATFORMS) if platform else None
+        lists = await client.exclusion_lists.list_all()
+        if wanted and isinstance(lists, list):
+            lists = [item for item in lists if item.get("platform") == wanted]
+        return json.dumps(lists, indent=2)
+    except Exception as e:
+        return _error_response(e)
+
+
+@mcp.tool(
+    name="create_exclusion_list",
+    annotations={"title": "Create Exclusion List", "readOnlyHint": False, "destructiveHint": False, "openWorldHint": True},
+)
+async def create_exclusion_list(
+    name: Annotated[str, Field(description="Name of the new list, unique per platform within your account (max 300 chars)", min_length=1, max_length=300)],
+    platform: Annotated[str, Field(description=f"Platform the list applies to ({_PLATFORMS_DESC})")],
+) -> str:
+    """Create a specific exclusion list for one platform and return it, including its id. Free.
+    For a standing, always-on blocklist use the platform's default list instead — it needs no creating,
+    it appears on first use: fill it with add_to_default_exclusion_list. A new list filters nothing
+    by itself: add handles, then pass its id in filters.exclude_list when searching."""
+    try:
+        name = _validate_list_name(name)
+        platform = _validate_platform(platform, DISCOVERY_PLATFORMS)
+        result = await client.exclusion_lists.create(name, platform)
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        return _error_response(e)
+
+
+@mcp.tool(
+    name="get_default_exclusion_list",
+    annotations={"title": "Get Default Exclusion List", "readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
+)
+async def get_default_exclusion_list(
+    platform: Annotated[str, Field(description=_DEFAULT_PLATFORM_DESC)],
+) -> str:
+    """Return a platform's default exclusion list (id, name, handle_count, ...). Free. The default list is
+    the team's standing blocklist for that platform; the API creates it, empty, the first time it is asked
+    for. It cannot be renamed or deleted. Apply it to a search with filters.exclude_default_list=true."""
+    try:
+        platform = _validate_platform(platform, DISCOVERY_PLATFORMS)
+        result = await client.exclusion_lists.get_default(platform)
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        return _error_response(e)
+
+
+@mcp.tool(
+    name="get_default_exclusion_list_handles",
+    annotations={"title": "Get Default Exclusion List Handles", "readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
+)
+async def get_default_exclusion_list_handles(
+    platform: Annotated[str, Field(description=_DEFAULT_PLATFORM_DESC)],
+    offset: Annotated[int, Field(description=_OFFSET_DESC, ge=0)] = 0,
+    limit: Annotated[int, Field(description=_LIMIT_DESC, ge=1, le=2000)] = 1000,
+) -> str:
+    """Page through the handles in a platform's default exclusion list. Returns {total, offset, limit,
+    handles}, handles in alphabetical order. Free. The API creates the list, empty, on first use."""
+    try:
+        platform = _validate_platform(platform, DISCOVERY_PLATFORMS)
+        result = await client.exclusion_lists.get_default_handles(platform, offset, limit)
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        return _error_response(e)
+
+
+@mcp.tool(
+    name="add_to_default_exclusion_list",
+    annotations={"title": "Add to Default Exclusion List", "readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
+)
+async def add_to_default_exclusion_list(
+    platform: Annotated[str, Field(description=_DEFAULT_PLATFORM_DESC)],
+    handles: Annotated[list[str], Field(description=_ADD_HANDLES_DESC, min_length=1, max_length=10_000)],
+) -> str:
+    """Add handles to a platform's default exclusion list and return the updated list (handle_count counts
+    unique handles). Free; adding a handle that is already there is a no-op. Adding handles filters nothing
+    by itself: pass filters.exclude_default_list=true when searching."""
+    try:
+        platform = _validate_platform(platform, DISCOVERY_PLATFORMS)
+        result = await client.exclusion_lists.add_default_handles(platform, _validate_handles(handles))
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        return _error_response(e)
+
+
+@mcp.tool(
+    name="remove_from_default_exclusion_list",
+    annotations={"title": "Remove from Default Exclusion List", "readOnlyHint": False, "destructiveHint": True, "idempotentHint": True, "openWorldHint": True},
+)
+async def remove_from_default_exclusion_list(
+    platform: Annotated[str, Field(description=_DEFAULT_PLATFORM_DESC)],
+    handles: Annotated[list[str], Field(description=_REMOVE_HANDLES_DESC, min_length=1, max_length=10_000)],
+) -> str:
+    """Remove handles from a platform's default exclusion list and return the updated list. Free; removing
+    a handle that is not there is a no-op."""
+    try:
+        platform = _validate_platform(platform, DISCOVERY_PLATFORMS)
+        result = await client.exclusion_lists.remove_default_handles(platform, _validate_handles(handles))
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        return _error_response(e)
+
+
+@mcp.tool(
+    name="get_exclusion_list",
+    annotations={"title": "Get Exclusion List", "readOnlyHint": True, "destructiveHint": False, "openWorldHint": True},
+)
+async def get_exclusion_list(
+    list_id: Annotated[int, Field(description=_LIST_ID_DESC, ge=1)],
+) -> str:
+    """Return one specific exclusion list by id: id, name, platform, is_default, handle_count, created_at,
+    updated_at. Free. Handles are not included — use get_exclusion_list_handles."""
+    try:
+        result = await client.exclusion_lists.get(list_id)
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        return _error_response(e)
+
+
+@mcp.tool(
+    name="rename_exclusion_list",
+    annotations={"title": "Rename Exclusion List", "readOnlyHint": False, "destructiveHint": False, "openWorldHint": True},
+)
+async def rename_exclusion_list(
+    list_id: Annotated[int, Field(description=_LIST_ID_DESC, ge=1)],
+    name: Annotated[str, Field(description="New name, unique per platform within your account (max 300 chars)", min_length=1, max_length=300)],
+) -> str:
+    """Rename a specific exclusion list and return the updated list. Free. Default lists cannot be renamed."""
+    try:
+        result = await client.exclusion_lists.rename(list_id, _validate_list_name(name))
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        return _error_response(e)
+
+
+@mcp.tool(
+    name="delete_exclusion_list",
+    annotations={"title": "Delete Exclusion List", "readOnlyHint": False, "destructiveHint": True, "openWorldHint": True},
+)
+async def delete_exclusion_list(
+    list_id: Annotated[int, Field(description=_LIST_ID_DESC, ge=1)],
+) -> str:
+    """Permanently delete a specific exclusion list and every handle in it. Free, cannot be undone.
+    Returns {deleted: true, id}. Default lists cannot be deleted — empty one with
+    remove_from_default_exclusion_list instead."""
+    try:
+        await client.exclusion_lists.delete(list_id)
+        return json.dumps({"deleted": True, "id": list_id}, indent=2)
+    except Exception as e:
+        return _error_response(e)
+
+
+@mcp.tool(
+    name="get_exclusion_list_handles",
+    annotations={"title": "Get Exclusion List Handles", "readOnlyHint": True, "destructiveHint": False, "openWorldHint": True},
+)
+async def get_exclusion_list_handles(
+    list_id: Annotated[int, Field(description=_LIST_ID_DESC, ge=1)],
+    offset: Annotated[int, Field(description=_OFFSET_DESC, ge=0)] = 0,
+    limit: Annotated[int, Field(description=_LIMIT_DESC, ge=1, le=2000)] = 1000,
+) -> str:
+    """Page through the handles in a specific exclusion list. Returns {total, offset, limit, handles},
+    handles in alphabetical order. Free."""
+    try:
+        result = await client.exclusion_lists.get_handles(list_id, offset, limit)
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        return _error_response(e)
+
+
+@mcp.tool(
+    name="add_to_exclusion_list",
+    annotations={"title": "Add to Exclusion List", "readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
+)
+async def add_to_exclusion_list(
+    list_id: Annotated[int, Field(description=_LIST_ID_DESC, ge=1)],
+    handles: Annotated[list[str], Field(description=_ADD_HANDLES_DESC, min_length=1, max_length=10_000)],
+) -> str:
+    """Add handles to a specific exclusion list and return the updated list (handle_count counts unique
+    handles). Free; adding a handle that is already there is a no-op. Adding handles filters nothing by
+    itself: pass the list's id in filters.exclude_list when searching."""
+    try:
+        result = await client.exclusion_lists.add_handles(list_id, _validate_handles(handles))
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        return _error_response(e)
+
+
+@mcp.tool(
+    name="remove_from_exclusion_list",
+    annotations={"title": "Remove from Exclusion List", "readOnlyHint": False, "destructiveHint": True, "idempotentHint": True, "openWorldHint": True},
+)
+async def remove_from_exclusion_list(
+    list_id: Annotated[int, Field(description=_LIST_ID_DESC, ge=1)],
+    handles: Annotated[list[str], Field(description=_REMOVE_HANDLES_DESC, min_length=1, max_length=10_000)],
+) -> str:
+    """Remove handles from a specific exclusion list and return the updated list. Free; removing a handle
+    that is not there is a no-op."""
+    try:
+        result = await client.exclusion_lists.remove_handles(list_id, _validate_handles(handles))
         return json.dumps(result, indent=2)
     except Exception as e:
         return _error_response(e)
@@ -767,7 +985,7 @@ async def audience_overlap(
         if len(creators) < 2 or len(creators) > 10:
             raise ValueError("Must provide 2-10 creator usernames")
 
-        result = await client.post(f"{API_V1}/creators/audience/overlap/", {"platform": platform, "creators": creators})
+        result = await client.discovery.audience_overlap(platform, creators)
         return json.dumps(result, indent=2)
     except Exception as e:
         return _error_response(e)
@@ -783,7 +1001,7 @@ async def audience_overlap(
 async def get_languages() -> str:
     """Get the list of supported language codes for discovery filters. Free (0 credits)."""
     try:
-        result = await client.get(f"{API_V1}/discovery/classifier/languages/")
+        result = await client.discovery.languages()
         return json.dumps(result, indent=2)
     except Exception as e:
         return _error_response(e)
@@ -799,7 +1017,7 @@ async def get_locations(
     """Get available location codes for a specific platform's discovery filters. Free (0 credits)."""
     try:
         platform = _validate_platform(platform, DISCOVERY_PLATFORMS)
-        result = await client.get(f"{API_V1}/discovery/classifier/locations/{platform}/")
+        result = await client.discovery.locations(platform)
         return json.dumps(result, indent=2)
     except Exception as e:
         return _error_response(e)
@@ -815,12 +1033,7 @@ async def get_brands(
 ) -> str:
     """Get available brand names for discovery filters (Instagram brand deal detection). Supports search and pagination. Free (0 credits)."""
     try:
-        params: dict[str, str] = {}
-        if search:
-            params["search"] = search.strip()
-        if offset is not None:
-            params["offset"] = str(offset)
-        result = await client.get(f"{API_V1}/discovery/classifier/brands/", params or None)
+        result = await client.discovery.brands(search, offset)
         return json.dumps(result, indent=2)
     except Exception as e:
         return _error_response(e)
@@ -833,7 +1046,7 @@ async def get_brands(
 async def get_youtube_topics() -> str:
     """Get available YouTube topic categories for discovery filters. Free (0 credits)."""
     try:
-        result = await client.get(f"{API_V1}/discovery/classifier/yt-topics/")
+        result = await client.discovery.youtube_topics()
         return json.dumps(result, indent=2)
     except Exception as e:
         return _error_response(e)
@@ -846,7 +1059,7 @@ async def get_youtube_topics() -> str:
 async def get_games() -> str:
     """Get available game names for Twitch discovery filters. Free (0 credits)."""
     try:
-        result = await client.get(f"{API_V1}/discovery/classifier/games/")
+        result = await client.discovery.games()
         return json.dumps(result, indent=2)
     except Exception as e:
         return _error_response(e)
@@ -862,12 +1075,7 @@ async def get_audience_brand_categories(
 ) -> str:
     """Search audience brand categories for Instagram audience filters. Supports pagination. Free (0 credits)."""
     try:
-        params: dict[str, str] = {}
-        if search:
-            params["search"] = search.strip()
-        if offset is not None:
-            params["offset"] = str(offset)
-        result = await client.get(f"{API_V1}/discovery/classifier/audience-brand-categories/", params or None)
+        result = await client.discovery.audience_brand_categories(search, offset)
         return json.dumps(result, indent=2)
     except Exception as e:
         return _error_response(e)
@@ -883,12 +1091,7 @@ async def get_audience_brand_names(
 ) -> str:
     """Search audience brand names for Instagram audience filters. Supports pagination. Free (0 credits)."""
     try:
-        params: dict[str, str] = {}
-        if search:
-            params["search"] = search.strip()
-        if offset is not None:
-            params["offset"] = str(offset)
-        result = await client.get(f"{API_V1}/discovery/classifier/audience-brand-names/", params or None)
+        result = await client.discovery.audience_brand_names(search, offset)
         return json.dumps(result, indent=2)
     except Exception as e:
         return _error_response(e)
@@ -904,12 +1107,7 @@ async def get_audience_interests(
 ) -> str:
     """Search audience interest categories for Instagram audience filters. Supports pagination. Free (0 credits)."""
     try:
-        params: dict[str, str] = {}
-        if search:
-            params["search"] = search.strip()
-        if offset is not None:
-            params["offset"] = str(offset)
-        result = await client.get(f"{API_V1}/discovery/classifier/audience-interests/", params or None)
+        result = await client.discovery.audience_interests(search, offset)
         return json.dumps(result, indent=2)
     except Exception as e:
         return _error_response(e)
@@ -925,12 +1123,7 @@ async def get_audience_locations(
 ) -> str:
     """Search audience locations for Instagram audience filters. Supports pagination. Free (0 credits)."""
     try:
-        params: dict[str, str] = {}
-        if search:
-            params["search"] = search.strip()
-        if offset is not None:
-            params["offset"] = str(offset)
-        result = await client.get(f"{API_V1}/discovery/classifier/audience-locations/", params or None)
+        result = await client.discovery.audience_locations(search, offset)
         return json.dumps(result, indent=2)
     except Exception as e:
         return _error_response(e)
@@ -952,7 +1145,7 @@ async def connected_socials(
     try:
         platform = _validate_platform(platform, SOCIAL_PLATFORMS)
         handle = _validate_handle(handle)
-        result = await client.post(f"{API_V1}/creators/socials/", {"platform": platform, "handle": handle})
+        result = await client.enrichment.connected_socials(platform, handle)
         return json.dumps(result, indent=2)
     except Exception as e:
         return _error_response(e)
@@ -964,6 +1157,44 @@ def _bulk_enrich_hint(items: str) -> str:
     return "" if HTTP_MODE else f" For bulk (more than ~10 {items}), use create_batch_enrichment."
 
 
+def _as_list(value: Any) -> Any:
+    """A bare section name becomes a one-item list, so the tool checks it rather than the schema refusing it."""
+    return [value] if isinstance(value, str) else value
+
+
+def _compact_when_null(value: Any) -> Any:
+    return "compact" if value is None else value
+
+
+_SECTIONS_DOC = (
+    "Parts of the report to return; default is every part. Name only what the question needs to "
+    "leave the rest out. overview: performance medians and hashtags; growth, income, posting frequency "
+    "and niche when available; "
+    "audience: demographics of followers and of engaged users (ages, genders, countries, cities, "
+    "languages, interests, credibility); audience_brands: brands the audience follows; "
+    "audience_notable_users: notable accounts among followers and engaged users; "
+    "audience_lookalikes: creators whose audience resembles this creator's; "
+    "sponsors: past sponsors and brands found in content; sponsored_posts: recent sponsored posts; "
+    "lookalikes: creators similar to this one."
+)
+_DETAIL_DOC = (
+    '"compact": media and profile links, internal IDs other than post IDs, and map coordinates left out, lists sent as '
+    "column/row tables, and the longest lists trimmed (top 30 audience brands, only verified accounts among "
+    "notable likers and commenters or the 10 largest when none is, captions cut to 120 characters, first 30 "
+    "other links); `notes` lists each cut. "
+    '"full": the same with nothing trimmed. "raw": the API response as it came, several times larger '
+    "(with `notes` only when a named section holds nothing)."
+)
+_PROFILE_DETAIL_DOC = (
+    '"compact": image links left out and other links cut to the first 30; `notes` lists each cut. '
+    '"full": the same with every link. "raw": the API response as it came.'
+)
+_RESULT_STEER = (
+    "Returns every section by default, compacted to fit a model's context; `sections` leaves out parts "
+    "the question doesn't need. Every call is billed in full. "
+)
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # 14. ENRICH BY HANDLE (FULL)
 # ═══════════════════════════════════════════════════════════════════════
@@ -971,18 +1202,28 @@ def _bulk_enrich_hint(items: str) -> str:
     name="enrich_by_handle",
     annotations={"title": "Enrich by Handle (Full)", "readOnlyHint": True, "destructiveHint": False, "openWorldHint": True},
     description=(
-        "Enrich ONE creator by handle (full data: email, demographics, audience, income, brand deals). "
-        "Costs 1 credit."
+        "Enrich ONE creator by handle (everything: email, demographics, audience, brand deals, recent posts, and an "
+        "income estimate when the creator has one). "
+        "Costs 1 credit. " + _RESULT_STEER +
+        "For half of it: enrich_by_handle_profile (identity and contact, 0.2 credits) or "
+        "enrich_by_handle_analytics (performance and audience, 0.8 credits). Those two together also cost 1 credit, "
+        "so this tool is the better call when both halves are wanted. For platform basics only (bio, follower "
+        "and post counts, verification), enrich_by_handle_raw costs 0.03 credits."
         + _bulk_enrich_hint("handles")
-        + " For basic profile data only, enrich_by_handle_raw returns a smaller result at 0.03 credits."
     ),
+    meta=_LARGE_RESULT_META,
 )
 async def enrich_by_handle(
     handle: Annotated[str, Field(description="Creator's username, profile URL, or YouTube channel ID")],
-    platform: Annotated[str, Field(description="Primary platform of the creator (NOT linkedin — use enrich_by_handle_raw for linkedin)")],
+    platform: Annotated[str, Field(description="Primary platform of the creator (NOT linkedin — for linkedin use enrich_by_handle_profile or enrich_by_handle_raw)")],
     email_required: Annotated[str, Field(description='"must_have" returns only if email found; "preferred" returns data even without email')] = "preferred",
-    include_lookalikes: Annotated[bool, Field(description="Include similar creator suggestions")] = False,
+    include_lookalikes: Annotated[Optional[bool], Field(description="Similar creators (the lookalikes section) come by default; false leaves them out")] = None,
     include_audience_data: Annotated[bool, Field(description="Include audience demographics (IG, TT, YT only)")] = True,
+    sections: Annotated[Optional[list[EnrichSection]], BeforeValidator(_as_list), Field(description=(
+        _SECTIONS_DOC + " On this tier overview also carries identity and contact fields, "
+        "and posts: recent posts with engagement."
+    ))] = None,
+    detail: Annotated[Detail, BeforeValidator(_compact_when_null), Field(description=_DETAIL_DOC)] = "compact",
 ) -> str:
     """Enrich ONE creator by handle (full data). Costs 1 credit. Client-facing description is set
     on the decorator so the bulk hint can be omitted in hosted mode (no create_batch_enrichment)."""
@@ -991,15 +1232,89 @@ async def enrich_by_handle(
         handle = _validate_handle(handle)
         if email_required not in ("must_have", "preferred"):
             raise ValueError("email_required must be 'must_have' or 'preferred'")
+        sections = validate_sections(sections, ENRICH_SECTIONS, include_lookalikes)
+        detail = validate_detail(detail)
 
-        result = await client.post(f"{API_V1}/creators/enrich/handle/full/", {
-            "handle": handle,
-            "platform": platform,
-            "email_required": email_required,
-            "include_lookalikes": include_lookalikes,
-            "include_audience_data": include_audience_data,
-        })
-        return json.dumps(result, indent=2)
+        result = await client.enrichment.by_handle_full(
+            handle,
+            platform,
+            email_required=email_required,
+            include_lookalikes="lookalikes" in sections,
+            include_audience_data=include_audience_data,
+        )
+        return _dump_json(shape_result(result, sections, ENRICH_SECTIONS, detail))
+    except Exception as e:
+        return _error_response(e)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# ENRICH BY HANDLE (PROFILE)
+# ═══════════════════════════════════════════════════════════════════════
+@mcp.tool(
+    name="enrich_by_handle_profile",
+    annotations={"title": "Enrich by Handle (Profile)", "readOnlyHint": True, "destructiveHint": False, "openWorldHint": True},
+    description=(
+        "Enrich ONE creator by handle — who they are and how to reach them: validated email, name, gender, "
+        "location, links to their accounts on other platforms, and vetting fields (verified, account type, "
+        "follower and post counts, bio, niche). Costs 0.2 credits. Works on every supported platform. "
+        "Carries no audience or performance data — that is enrich_by_handle_analytics (0.8 credits)."
+    ),
+)
+async def enrich_by_handle_profile(
+    handle: Annotated[str, Field(description="Creator's username, profile URL, or YouTube channel ID")],
+    platform: Annotated[str, Field(description="Primary platform of the creator")],
+    email_required: Annotated[str, Field(description='"must_have" returns only if a valid email is found (and costs nothing when none is); "preferred" returns data either way')] = "preferred",
+    detail: Annotated[Detail, BeforeValidator(_compact_when_null), Field(description=_PROFILE_DETAIL_DOC)] = "compact",
+) -> str:
+    """Enrich ONE creator by handle (identity and contact tier, 0.2 cr). Client-facing description is
+    set on the decorator."""
+    try:
+        platform = _validate_platform(platform, SOCIAL_PLATFORMS)
+        handle = _validate_handle(handle)
+        if email_required not in ("must_have", "preferred"):
+            raise ValueError("email_required must be 'must_have' or 'preferred'")
+        detail = validate_detail(detail)
+
+        result = await client.enrichment.by_handle_profile(handle, platform, email_required=email_required)
+        # Small, but half of it is two copies of the profile-picture link.
+        return _dump_json(shape_profile(result, detail))
+    except Exception as e:
+        return _error_response(e)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# ENRICH BY HANDLE (ANALYTICS)
+# ═══════════════════════════════════════════════════════════════════════
+@mcp.tool(
+    name="enrich_by_handle_analytics",
+    annotations={"title": "Enrich by Handle (Analytics)", "readOnlyHint": True, "destructiveHint": False, "openWorldHint": True},
+    description=(
+        "Enrich ONE creator by handle — how they perform and who follows them: audience demographics and "
+        "interests, engagement medians, brand affinity and past sponsors, plus follower growth, posting "
+        "frequency and an income estimate when the creator has them. Costs 0.8 credits. " + _RESULT_STEER +
+        "Only instagram, youtube, tiktok, twitch, twitter and onlyfans have analytics data. "
+        "Carries no email, identity, follower count or engagement rate — that is enrich_by_handle_profile "
+        "(0.2 credits)."
+    ),
+    meta=_LARGE_RESULT_META,
+)
+async def enrich_by_handle_analytics(
+    handle: Annotated[str, Field(description="Creator's username, profile URL, or YouTube channel ID")],
+    platform: Annotated[str, Field(description="Primary platform of the creator (analytics exists only for instagram, youtube, tiktok, twitch, twitter, onlyfans)")],
+    include_lookalikes: Annotated[Optional[bool], Field(description="Similar creators (the lookalikes section) come by default; false leaves them out")] = None,
+    sections: Annotated[Optional[list[AnalyticsSection]], BeforeValidator(_as_list), Field(description=_SECTIONS_DOC)] = None,
+    detail: Annotated[Detail, BeforeValidator(_compact_when_null), Field(description=_DETAIL_DOC)] = "compact",
+) -> str:
+    """Enrich ONE creator by handle (performance and audience tier, 0.8 cr). Client-facing description is
+    set on the decorator."""
+    try:
+        platform = _validate_platform(platform, ENRICH_ANALYTICS_PLATFORMS)
+        handle = _validate_handle(handle)
+        sections = validate_sections(sections, ENRICH_ANALYTICS_SECTIONS, include_lookalikes)
+        detail = validate_detail(detail)
+
+        result = await client.enrichment.by_handle_analytics(handle, platform, include_lookalikes="lookalikes" in sections)
+        return _dump_json(shape_result(result, sections, ENRICH_ANALYTICS_SECTIONS, detail))
     except Exception as e:
         return _error_response(e)
 
@@ -1011,7 +1326,10 @@ async def enrich_by_handle(
     name="enrich_by_handle_raw",
     annotations={"title": "Enrich by Handle (Raw)", "readOnlyHint": True, "destructiveHint": False, "openWorldHint": True},
     description=(
-        "Enrich ONE creator by handle (basic). Costs 0.03 credits. Supports linkedin."
+        "Enrich ONE creator by handle (platform basics as the source reports them: bio, follower and post "
+        "counts, verification, recent post data). Costs 0.03 credits — the cheapest tier. Supports linkedin. "
+        "Richer tiers: enrich_by_handle_profile (identity and contact, 0.2 credits), enrich_by_handle_analytics "
+        "(performance and audience, 0.8 credits), enrich_by_handle (everything, 1 credit)."
         + _bulk_enrich_hint("handles")
     ),
 )
@@ -1023,7 +1341,7 @@ async def enrich_by_handle_raw(
     try:
         platform = _validate_platform(platform, SOCIAL_PLATFORMS)
         handle = _validate_handle(handle)
-        result = await client.post(f"{API_V1}/creators/enrich/handle/raw/", {"handle": handle, "platform": platform})
+        result = await client.enrichment.by_handle_raw(handle, platform)
         return json.dumps(result, indent=2)
     except Exception as e:
         return _error_response(e)
@@ -1045,7 +1363,7 @@ async def enrich_by_email(
         email = email.strip().lower()
         if not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", email):
             raise ValueError("Invalid email address format")
-        result = await client.post(f"{API_V1}/creators/enrich/email/", {"email": email})
+        result = await client.enrichment.by_email(email)
         return json.dumps(result, indent=2)
     except Exception as e:
         return _error_response(e)
@@ -1123,7 +1441,7 @@ async def create_batch_enrichment(
             ]
             handle_options = [
                 {"mode": "raw", "input": "handles", "cost": "0.03 credits/record", "description": "Basic profile info (bio, followers, verified). Requires platform."},
-                {"mode": "full", "input": "handles", "cost": "1 credit/record", "description": "Everything: email, demographics, audience, income, brand deals. Requires platform."},
+                {"mode": "full", "input": "handles", "cost": "1 credit/record", "description": "Everything: email, demographics, audience, brand deals, and an income estimate when the creator has one. Requires platform."},
             ]
 
             if detected_input == "email":
@@ -1234,20 +1552,15 @@ async def create_batch_enrichment(
         except Exception:
             pass  # don't block submission over a warning
 
-        files = {"file": ("batch.csv", csv_bytes, "text/csv")}
-        data: dict[str, str] = {"enrichment_mode": enrichment_mode}
-        if platform:
-            data["platform"] = platform
-        if email_required:
-            data["email_required"] = email_required
-        if include_lookalikes is not None:
-            data["include_lookalikes"] = str(include_lookalikes).lower()
-        if include_audience_data is not None:
-            data["include_audience_data"] = str(include_audience_data).lower()
-        if metadata:
-            data["metadata"] = json.dumps(metadata) if isinstance(metadata, dict) else str(metadata)
-
-        result = await client.post_multipart(f"{API_V1}/enrichment/batch/", files, data)
+        result = await client.batch.create(
+            csv_bytes,
+            enrichment_mode,
+            platform=platform,
+            email_required=email_required,
+            include_lookalikes=include_lookalikes,
+            include_audience_data=include_audience_data,
+            metadata=metadata,
+        )
         if isinstance(result, dict):
             if duplicate_warning:
                 result["duplicate_warning"] = duplicate_warning
@@ -1311,7 +1624,7 @@ async def get_batch_status(
             if wait_remaining > 0:
                 await asyncio.sleep(wait_remaining)
 
-        result = await client.get(f"{API_V1}/enrichment/batch/{batch_id}/status/")
+        result = await client.batch.status(batch_id)
 
         # Cache with current time AFTER the API call (not before sleep)
         _batch_poll_cache[batch_id] = (time.time(), result)
@@ -1398,9 +1711,7 @@ async def download_batch_results(
             file_path = output_path / f"{base_name}.csv"
 
         # Fetch as JSON from API (CSV format returns 404), then convert to CSV
-        result = await client.get(
-            f"{API_V1}/enrichment/batch/{batch_id}/", {"format": "json"}, timeout=120.0
-        )
+        result = await client.batch.results(batch_id)
 
         # Extract the results list from the API response
         if isinstance(result, list):
@@ -1416,11 +1727,11 @@ async def download_batch_results(
             raw_data = []
 
         # Build preview of top 10 rows for UI display
-        preview = _preview_rows(raw_data) if raw_data else []
+        preview = preview_rows(raw_data) if raw_data else []
         total_records = len(raw_data)
 
         # Convert JSON to CSV
-        csv_text = _json_batch_to_csv(result)
+        csv_text = json_batch_to_csv(result)
 
         # Save to file
         output_path.mkdir(parents=True, exist_ok=True)
@@ -1459,7 +1770,7 @@ async def resume_batch(
         batch_id = batch_id.strip()
         if not batch_id:
             raise ValueError("batch_id is required")
-        result = await client.post(f"{API_V1}/enrichment/batch/{batch_id}/resume/", {})
+        result = await client.batch.resume(batch_id)
         return json.dumps(result, indent=2)
     except Exception as e:
         return _error_response(e)
@@ -1483,12 +1794,7 @@ async def get_creator_posts(
     try:
         platform = _validate_platform(platform, CONTENT_PLATFORMS)
         handle = _validate_handle(handle)
-        body: dict[str, Any] = {"platform": platform, "handle": handle}
-        if count is not None:
-            body["count"] = count
-        if pagination_token:
-            body["pagination_token"] = pagination_token
-        result = await client.post(f"{API_V1}/creators/content/posts/", body)
+        result = await client.content.posts(platform, handle, count=count, pagination_token=pagination_token)
         return json.dumps(result, indent=2)
     except Exception as e:
         return _error_response(e)
@@ -1519,10 +1825,7 @@ async def get_post_details(
         if not post_id:
             raise ValueError("post_id is required")
 
-        body: dict[str, Any] = {"platform": platform, "post_id": post_id, "content_type": content_type}
-        if pagination_token:
-            body["pagination_token"] = pagination_token
-        result = await client.post(f"{API_V1}/creators/content/details/", body)
+        result = await client.content.post_details(platform, post_id, content_type, pagination_token=pagination_token)
         return json.dumps(result, indent=2)
     except Exception as e:
         return _error_response(e)
@@ -1539,7 +1842,7 @@ async def check_credits() -> str:
     """Check your Influencers.club account credit balance and usage. Free (0 credits).
     Use this to verify you have enough credits before expensive operations."""
     try:
-        result = await client.get(f"{API_V1}/accounts/credits/")
+        result = await client.account.credits()
         return json.dumps(result, indent=2)
     except Exception as e:
         return _error_response(e)
