@@ -14,6 +14,8 @@ import time
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 
+from .csv_import import count_csv_rows, header_columns, to_single_column
+
 def _is_docker() -> bool:
     """Detect if running inside a Docker container."""
     return os.path.exists("/.dockerenv") or os.path.exists("/run/.containerenv")
@@ -50,16 +52,6 @@ def _sanitize_filename(name: str) -> str:
     if len(name) > 100:
         name = name[:96] + '.csv'
     return name or 'upload.csv'
-
-
-def _count_csv_rows(content: bytes) -> int:
-    """Count data rows in CSV content (excluding header)."""
-    try:
-        text = content.decode('utf-8', errors='replace')
-        lines = [line for line in text.strip().split('\n') if line.strip()]
-        return max(0, len(lines) - 1)
-    except Exception:
-        return 0
 
 
 def _get_export_host_dir() -> str:
@@ -416,7 +408,7 @@ class UploadHandler(BaseHTTPRequestHandler):
             if imports.exists():
                 for f in sorted(imports.glob('*.csv'), key=lambda p: p.stat().st_mtime, reverse=True)[:5]:
                     stat = f.stat()
-                    rows = _count_csv_rows(f.read_bytes()) if stat.st_size < 10 * 1024 * 1024 else -1
+                    rows = count_csv_rows(f.read_bytes().decode('utf-8', errors='replace')) if stat.st_size < 10 * 1024 * 1024 else -1
                     files.append({
                         'filename': f.name,
                         'size_bytes': stat.st_size,
@@ -456,89 +448,22 @@ class UploadHandler(BaseHTTPRequestHandler):
                 return
 
             # Auto-detect column with emails/handles, fix header, strip to single column
-            import csv as _csv
-            import io as _io
-
-            header_cols = [c.strip().lower().replace('"', '').replace("'", "") for c in lines[0].split(',')]
-            multi_column = len(header_cols) > 1
-            valid_headers = ('email', 'handle', 'emails', 'handles')
-            header_fixed = False
+            try:
+                fixed = to_single_column(lines, first_line_is_header=True)
+            except ValueError as e:
+                self._send_json(400, {'error': True, 'message': str(e)})
+                return
+            header_fixed = fixed is not None
             columns_stripped = False
-
-            # Find the best column: scan all columns for emails/handles
-            best_col_idx = 0
-            detected_type = 'handle'
-
-            if multi_column:
-                # Try to find a column with a valid header name first
-                for i, col_name in enumerate(header_cols):
-                    if col_name in valid_headers:
-                        best_col_idx = i
-                        detected_type = 'email' if col_name in ('email', 'emails') else 'handle'
-                        break
+            if fixed:
+                new_lines, detected_type, col = fixed
+                if col is None:
+                    logger.info("Auto-fixed header: '%s' -> '%s'", header_columns(lines[0])[0], detected_type)
                 else:
-                    # No valid header found — scan ALL columns to find the best one
-                    best_email_score = -1
-                    for col_idx in range(len(header_cols)):
-                        sample_values = []
-                        for row in lines[1:6]:
-                            cols = row.split(',')
-                            if col_idx < len(cols):
-                                val = cols[col_idx].strip().replace('"', '').replace("'", "")
-                                if val:
-                                    sample_values.append(val)
-                        if not sample_values:
-                            continue
-                        email_count = sum(1 for v in sample_values if '@' in v and '.' in v.split('@')[-1])
-                        email_ratio = email_count / len(sample_values)
-                        if email_ratio > 0.5 and email_count > best_email_score:
-                            best_email_score = email_count
-                            best_col_idx = col_idx
-                            detected_type = 'email'
-
-                    # If no email column found, default to column 0 as handles
-                    if best_email_score < 0:
-                        best_col_idx = 0
-                        detected_type = 'handle'
-
-                # Extract only the best column into a single-column CSV
-                reader = _csv.reader(_io.StringIO('\n'.join(lines)))
-                new_lines = [detected_type]  # header
-                for i, row in enumerate(reader):
-                    if i == 0:
-                        continue  # skip original header
-                    if best_col_idx < len(row):
-                        val = row[best_col_idx].strip()
-                        if val:
-                            new_lines.append(val)
-
+                    columns_stripped = True
+                    logger.info("Stripped to single column (col %s), header set to '%s'", col, detected_type)
                 lines = new_lines
                 body = '\n'.join(lines).encode('utf-8')
-                columns_stripped = True
-                header_fixed = True
-                logger.info("Stripped to single column (col %s), header set to '%s'", best_col_idx, detected_type)
-
-            else:
-                # Single column — just fix the header if needed
-                first_col = header_cols[0] if header_cols else ''
-                if first_col not in valid_headers:
-                    sample_values = []
-                    for row in lines[1:6]:
-                        val = row.strip().replace('"', '').replace("'", "")
-                        if val:
-                            sample_values.append(val)
-
-                    if not sample_values:
-                        self._send_json(400, {'error': True, 'message': 'CSV has no data rows'})
-                        return
-
-                    email_count = sum(1 for v in sample_values if '@' in v and '.' in v.split('@')[-1])
-                    detected_type = 'email' if email_count > len(sample_values) / 2 else 'handle'
-
-                    lines[0] = detected_type
-                    body = '\n'.join(lines).encode('utf-8')
-                    header_fixed = True
-                    logger.info("Auto-fixed header: '%s' -> '%s'", first_col, detected_type)
 
             row_count = len(lines) - 1
 
