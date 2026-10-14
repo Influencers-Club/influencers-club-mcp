@@ -1,7 +1,7 @@
 {
   "name": "influencers-club",
   "description": "Creator discovery, enrichment, and audience analysis via the Influencers Club API. Sign in with your Influencers Club account - no API key to copy around.",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "author": {
     "name": "Influencers.club"
   },

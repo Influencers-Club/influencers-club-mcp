@@ -36,6 +36,16 @@ class EnrichmentApi:
         }
         return await self._client.post(f"{CREATORS}enrich/handle/full/", body)
 
+    async def by_handle_profile(self, handle: str, platform: str, *, email_required: str) -> Any:
+        """POST /creators/enrich/handle/profile/ - who one creator is and how to reach them."""
+        body = {"handle": handle, "platform": platform, "email_required": email_required}
+        return await self._client.post(f"{CREATORS}enrich/handle/profile/", body)
+
+    async def by_handle_analytics(self, handle: str, platform: str, *, include_lookalikes: bool) -> Any:
+        """POST /creators/enrich/handle/analytics/ - how one creator performs and who follows them."""
+        body = {"handle": handle, "platform": platform, "include_lookalikes": include_lookalikes}
+        return await self._client.post(f"{CREATORS}enrich/handle/analytics/", body)
+
     async def by_handle_raw(self, handle: str, platform: str) -> Any:
         """POST /creators/enrich/handle/raw/ - the basic profile of one creator."""
         return await self._client.post(f"{CREATORS}enrich/handle/raw/", {"handle": handle, "platform": platform})
