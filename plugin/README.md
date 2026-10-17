@@ -5,7 +5,7 @@ Influencers Club connects your AI assistant to creator data across Instagram, Ti
 ## What you get
 
 - Creator discovery with semantic search and filters for followers, engagement, location, and language
-- Profile enrichment at three depths, from a quick profile to full analytics with contact details, audience demographics, and past brand deals
+- Profile enrichment at different depths, from a quick profile to full analytics with contact details, audience demographics, and past brand deals
 - Recent posts with engagement metrics, audience-overlap comparison between creators, and lookalike search for creators similar to one that already performs well
 - Team exclusion lists that keep creators you have already contacted out of your searches
 
