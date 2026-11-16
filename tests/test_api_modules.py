@@ -371,6 +371,25 @@ def test_host_export_path_keeps_the_host_style(monkeypatch):
         assert server._host_export_path(Path("/exports") / "b.csv") == want
 
 
+def test_batch_from_a_full_path_uses_that_file_not_a_same_named_one(monkeypatch, tmp_path):
+    from influencers_club_mcp import server
+
+    chosen, old = tmp_path / "chosen", tmp_path / "old"
+    for folder, handle in ((chosen, "wrong"), (old, "right"), (tmp_path / "imports", "wrong")):
+        folder.mkdir()
+        (folder / "list.csv").write_bytes(f"handle\n{handle}\n".encode())
+    monkeypatch.setattr(server, "_is_docker", lambda: False)
+    monkeypatch.setattr(server, "_get_export_host_dir", lambda: str(chosen))
+    monkeypatch.setattr(server, "OUTPUT_DIR", str(old))
+    monkeypatch.setattr(server, "IMPORTS_DIR", str(tmp_path / "imports"))
+    monkeypatch.setattr(server, "_get_mcp_client_name", lambda: "claude-code")
+    fake = FakeClient()
+    monkeypatch.setattr(server, "client", fake)
+
+    asyncio.run(server.create_batch_enrichment(enrichment_mode="raw", platform="instagram", csv_file_path=str(old / "list.csv")))
+    assert fake.calls[0][3]["file"][1] == b"handle\nright\n"
+
+
 def test_setup_export_path_refuses_a_relative_folder(monkeypatch, tmp_path):
     from influencers_club_mcp import server
 

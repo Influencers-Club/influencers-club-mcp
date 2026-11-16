@@ -1441,8 +1441,10 @@ async def create_batch_enrichment(
                 if csv_file_path:
                     p = csv_file_path.strip()
                     fname = os.path.basename(p)
-                    for try_dir in [IMPORTS_DIR, *_export_dirs()]:
-                        try_path = Path(try_dir) / fname
+                    candidates = [Path(d) / fname for d in [IMPORTS_DIR, *_export_dirs()]]
+                    if os.path.isabs(p):
+                        candidates.insert(0, Path(p))  # a real file on this machine wins over a same-named one
+                    for try_path in candidates:
                         if try_path.exists():
                             peek_text = try_path.read_text(encoding="utf-8", errors="replace")
                             break
@@ -1507,7 +1509,9 @@ async def create_batch_enrichment(
 
             # Check imports directory first (uploaded files)
             import_host_dir = os.environ.get("IMPORT_HOST_DIR", "")
-            if import_host_dir and host_path.replace("\\", "/").startswith(import_host_dir.replace("\\", "/")):
+            if os.path.isabs(host_path) and os.path.isfile(host_path):
+                container_path = Path(host_path)  # a real file on this machine: exactly that one
+            elif import_host_dir and host_path.replace("\\", "/").startswith(import_host_dir.replace("\\", "/")):
                 relative = host_path.replace("\\", "/")[len(import_host_dir.replace("\\", "/")):].lstrip("/")
                 container_path = Path(IMPORTS_DIR) / relative
             else:
