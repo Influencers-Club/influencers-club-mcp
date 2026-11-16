@@ -227,7 +227,7 @@ Team-shared blocklists of creator handles: one default list per platform plus an
 |---|---|---|
 | `create_batch_enrichment` | Upload CSV of up to 10,000 handles/emails for bulk processing | varies |
 | `get_batch_status` | Check batch job progress (auto-polls every 35s) | free |
-| `download_batch_results` | Download completed batch results as CSV | free |
+| `download_batch_results` | Batch results as CSV: saved to disk locally, a download link on the hosted server | free |
 | `resume_batch` | Resume a paused batch after adding credits | free |
 
 ### File Management *(local only)*

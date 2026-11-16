@@ -9,7 +9,9 @@ import asyncio
 import importlib.metadata
 import json
 import logging
+import ntpath
 import os
+import posixpath
 import re
 import time as _time
 from datetime import datetime, timezone
@@ -24,7 +26,7 @@ from pydantic import BeforeValidator, Field
 
 from .api_client import ApiError, InfluencersApiClient
 from .auth import IntrospectionUnavailableMiddleware
-from .csv_export import creators_to_csv, json_batch_to_csv, preview_rows
+from .csv_export import creators_to_csv
 from .csv_import import count_csv_rows, mostly_emails, to_single_column
 from .discovery_filters import DiscoveryFilters, coerce_filters
 from .enrich_results import (
@@ -74,10 +76,41 @@ def _get_export_host_dir() -> str:
             with open(CONFIG_FILE) as f:
                 cfg = json.load(f)
             if cfg.get("export_host_dir"):
-                return cfg["export_host_dir"]
+                return _expand(cfg["export_host_dir"])
         except (json.JSONDecodeError, OSError):
             pass
-    return os.environ.get("EXPORT_HOST_DIR", "")
+    return _expand(os.environ.get("EXPORT_HOST_DIR", ""))
+
+
+def _expand(path: str) -> str:
+    """~ means the home of the machine the server runs on, so only outside Docker."""
+    return path if _is_docker() else os.path.expanduser(path)
+
+
+def _export_write_dir() -> Path:
+    """The folder export files are written to and read back from.
+
+    In Docker, OUTPUT_DIR is the mount of the folder the user chose. Anywhere else
+    nothing is mounted, so the chosen folder itself is used.
+    """
+    host_dir = _get_export_host_dir()
+    return Path(host_dir) if host_dir and not _is_docker() else Path(OUTPUT_DIR)
+
+
+def _export_dirs() -> list[Path]:
+    """Folders searched for existing exports: the current one, then the server's own folder
+    (where exports went before the chosen folder was used outside Docker)."""
+    return list(dict.fromkeys([_export_write_dir(), Path(OUTPUT_DIR)]))
+
+
+def _host_export_path(path: Path) -> str:
+    """Where the user finds an export file, in the path style of their machine. In Docker the
+    host can be Windows while the server runs on Linux."""
+    host_dir = _get_export_host_dir()
+    if not host_dir or path.parent != _export_write_dir():
+        return str(path)
+    windows = "\\" in host_dir or host_dir[1:2] == ":"
+    return (ntpath if windows else posixpath).join(host_dir, path.name)
 
 DISCOVERY_PLATFORMS = ("instagram", "youtube", "tiktok", "twitch", "twitter", "onlyfans")
 ENRICHMENT_PLATFORMS = DISCOVERY_PLATFORMS
@@ -186,8 +219,8 @@ if HTTP_MODE:
         _mcp_kwargs["auth"] = _auth_settings
 
 # Server-level instructions. The hosted (HTTP) variant must only describe tools that
-# actually exist in hosted mode — batch/file tools are stdio-only, so their sections
-# are appended only for stdio. Keep wording descriptive (what tools do), not behavioral.
+# actually exist in hosted mode — file tools and every batch tool but the download are
+# stdio-only, so their sections are appended only for stdio. Keep wording descriptive (what tools do), not behavioral.
 _INSTRUCTIONS_CORE = (
     "MCP server for the Influencers Club API: creator discovery, enrichment, and content analytics.\n\n"
     "Errors: tool errors are JSON with a message field; if an error includes a user_message, "
@@ -208,7 +241,9 @@ _INSTRUCTIONS_CORE = (
     "remove_from_exclusion_list); each platform also has one default list addressed by platform "
     "(get_default_exclusion_list, get_default_exclusion_list_handles, add_to_default_exclusion_list, "
     "remove_from_default_exclusion_list). A list only affects a search when the discover_creators or "
-    "find_similar_creators filters carry exclude_list (ids), exclude_default_list or exclude_all_lists.\n"
+    "find_similar_creators filters carry exclude_list (ids), exclude_default_list or exclude_all_lists.\n\n"
+    "download_batch_results returns a finished batch's results as a CSV: a download link on the hosted "
+    "server, a saved file on a local install. A link expires; call the tool again for a fresh one.\n"
 )
 
 _INSTRUCTIONS_STDIO_EXTRAS = (
@@ -216,7 +251,7 @@ _INSTRUCTIONS_STDIO_EXTRAS = (
     "to CSV on disk. Bulk enrichment runs as batch jobs: get_upload_url provides the CSV upload "
     "page, wait_for_upload blocks until the file lands, create_batch_enrichment starts the job "
     "(first call returns a mode menu; a second call with the chosen mode starts it), "
-    "get_batch_status reports progress, and download_batch_results fetches the output once. "
+    "get_batch_status reports progress, and download_batch_results saves the results CSV. "
     "The uploaded CSV needs a 'handle' or 'email' header.\n"
 )
 
@@ -626,7 +661,7 @@ async def discover_creators_to_file(
             f["ai_search"] = ai_search
 
         # Ensure output directory exists
-        output_path = Path(OUTPUT_DIR)
+        output_path = _export_write_dir()
         output_path.mkdir(parents=True, exist_ok=True)
 
         # Fetch all pages (0-indexed)
@@ -661,16 +696,9 @@ async def discover_creators_to_file(
         file_path = output_path / file_name
         file_path.write_text(csv_content, encoding="utf-8")
 
-        # Build host path for user display
-        export_dir = _get_export_host_dir()
-        if export_dir:
-            host_path = os.path.join(export_dir, file_name).replace("/", "\\")
-        else:
-            host_path = str(file_path)
-
         return json.dumps({
             "success": True,
-            "file": host_path,
+            "file": _host_export_path(file_path),
             "container_path": str(file_path),
             "total_creators_exported": len(all_creators),
             "total_available": total_available,
@@ -1413,7 +1441,7 @@ async def create_batch_enrichment(
                 if csv_file_path:
                     p = csv_file_path.strip()
                     fname = os.path.basename(p)
-                    for try_dir in [IMPORTS_DIR, OUTPUT_DIR]:
+                    for try_dir in [IMPORTS_DIR, *_export_dirs()]:
                         try_path = Path(try_dir) / fname
                         if try_path.exists():
                             peek_text = try_path.read_text(encoding="utf-8", errors="replace")
@@ -1487,13 +1515,13 @@ async def create_batch_enrichment(
                 export_dir = _get_export_host_dir()
                 if export_dir and host_path.replace("\\", "/").startswith(export_dir.replace("\\", "/")):
                     relative = host_path.replace("\\", "/")[len(export_dir.replace("\\", "/")):].lstrip("/")
-                    container_path = Path(OUTPUT_DIR) / relative
+                    container_path = _export_write_dir() / relative
 
             # Also try just the filename in /imports (most common case)
             if container_path is None or not container_path.exists():
                 fname = os.path.basename(host_path)
                 imports_try = Path(IMPORTS_DIR) / fname
-                exports_try = Path(OUTPUT_DIR) / fname
+                exports_try = next((d / fname for d in _export_dirs() if (d / fname).exists()), _export_write_dir() / fname)
                 if imports_try.exists():
                     container_path = imports_try
                 elif exports_try.exists():
@@ -1656,96 +1684,55 @@ async def get_batch_status(
 # ═══════════════════════════════════════════════════════════════════════
 # 20. BATCH DOWNLOAD
 # ═══════════════════════════════════════════════════════════════════════
-@stdio_only_tool(
+@mcp.tool(
     name="download_batch_results",
-    annotations={"title": "Download Batch Results", "readOnlyHint": False, "destructiveHint": False, "openWorldHint": True},
+    annotations={"title": "Download Batch Results", "readOnlyHint": HTTP_MODE, "destructiveHint": False, "openWorldHint": True},
 )
 async def download_batch_results(
     batch_id: Annotated[str, Field(description="Batch job ID")],
 ) -> str:
-    """Download batch results as CSV. Claude Code only. Free (0 credits).
+    """Get a batch's results as a CSV file. Free (0 credits). The rows are never returned to the chat.
 
-    On other clients, use create_batch_enrichment (with no parameters) instead.
-
-    Saves to the influencer-exports folder; the batch must be 'finished' or 'paused_insufficient_credits'.
-    The filename is auto-generated — report the path and show the 'preview' table (successfully enriched
-    rows only, not 'not_found'/failed ones). No need to re-enrich rows individually afterward — that costs credits."""
+    The batch must be 'finished' or 'paused_insufficient_credits' (partial results).
+    The result carries either 'file', the path of the CSV saved on this machine (local install), or
+    'download_url', a link for the user to open (hosted). The link stops working at 'expires_at':
+    call this tool again for a fresh one instead of reusing a link from earlier in the conversation.
+    Status 'results_not_ready': no results file yet. For a 'paused_insufficient_credits' batch it
+    appears only after credits are added and resume_batch runs; otherwise call again in about a minute.
+    No need to re-enrich rows individually afterward — that costs credits."""
     try:
-        if "claude-code" not in _get_mcp_client_name().lower():
-            return _claude_code_error("download_batch_results")
         batch_id = batch_id.strip()
         if not batch_id:
             raise ValueError("batch_id is required")
 
-        export_dir = _get_export_host_dir()
-        if not export_dir:
+        if not HTTP_MODE and not _get_export_host_dir():
             raise ValueError(
                 "Export path not configured. Ask the user where they want exported files saved, "
                 "then call setup_export_path with their answer. This only needs to be done once."
             )
 
-        # Build unique filename: short_batch_id + source CSV name (if known from imports)
-        short_id = batch_id.replace("bch_", "")[:8]
-        source_label = ""
-        imports = Path(IMPORTS_DIR)
-        if imports.exists():
-            # Find most recently modified CSV in imports as likely source
-            csv_files = sorted(imports.glob("*.csv"), key=lambda p: p.stat().st_mtime, reverse=True)
-            if csv_files:
-                stem = csv_files[0].stem
-                # Shorten to max 40 chars
-                source_label = re.sub(r'[^\w\-]', '_', stem)[:40].rstrip('_')
+        try:
+            link = await client.batch.download_link(batch_id)
+        except ApiError as e:
+            if e.code != "results_not_ready":
+                raise
+            return json.dumps({"batch_id": batch_id, "status": "results_not_ready", "message": e.message}, indent=2)
 
-        if source_label:
-            base_name = f"{source_label}_{short_id}"
-        else:
-            base_name = f"batch_{short_id}"
+        if HTTP_MODE:
+            return json.dumps(link, indent=2)
 
-        output_path = Path(OUTPUT_DIR)
-        file_path = output_path / f"{base_name}.csv"
-
-        # If file exists, add timestamp to avoid overwrite
-        if file_path.exists():
-            ts = int(_time.time())
-            base_name = f"{base_name}_{ts}"
-            file_path = output_path / f"{base_name}.csv"
-
-        # Fetch as JSON from API (CSV format returns 404), then convert to CSV
-        result = await client.batch.results(batch_id)
-
-        # Extract the results list from the API response
-        if isinstance(result, list):
-            raw_data = result
-        elif isinstance(result, dict):
-            for key in ("results", "data"):
-                if key in result and isinstance(result[key], list):
-                    raw_data = result[key]
-                    break
-            else:
-                raw_data = []
-        else:
-            raw_data = []
-
-        # Build preview of top 10 rows for UI display
-        preview = preview_rows(raw_data) if raw_data else []
-        total_records = len(raw_data)
-
-        # Convert JSON to CSV
-        csv_text = json_batch_to_csv(result)
-
-        # Save to file
-        output_path.mkdir(parents=True, exist_ok=True)
-        file_path.write_text(csv_text, encoding="utf-8")
-
-        host_path = os.path.join(export_dir, f"{base_name}.csv")
-
+        out_dir = _export_write_dir()
+        out_dir.mkdir(parents=True, exist_ok=True)
+        path = out_dir / Path(link["filename"]).name  # named after the batch id by the API
+        if path.exists():  # an earlier download, maybe edited: keep it
+            path = path.with_name(f"{path.stem}_{int(_time.time())}{path.suffix}")
+        await client.download_file(link["download_url"], path)
         return json.dumps({
             "success": True,
-            "file": host_path,
+            "file": _host_export_path(path),
             "batch_id": batch_id,
-            "total_records": total_records,
-            "preview": preview,
-            "message": f"Showing top {len(preview)} of {total_records} results. Full data saved to: {host_path}",
+            "total_results": link.get("total_results"),
+            "invalid_records": link.get("invalid_records"),
         }, indent=2)
     except Exception as e:
         return _error_response(e)
@@ -2001,14 +1988,14 @@ async def list_import_files() -> str:
 async def list_export_files() -> str:
     """List result/output CSV files (batch results, discovery exports). Shows 10 most recent. Free (0 credits)."""
     try:
-        exports = Path(OUTPUT_DIR)
         export_dir = _get_export_host_dir()
         files = []
 
-        if exports.exists():
-            for f in sorted(exports.glob("*.csv"), key=lambda p: p.stat().st_mtime, reverse=True)[:10]:
+        found = [f for d in _export_dirs() if d.exists() for f in d.glob("*.csv")]
+        if found:
+            for f in sorted(found, key=lambda p: p.stat().st_mtime, reverse=True)[:10]:
                 stat = f.stat()
-                host_path = os.path.join(export_dir, f.name) if export_dir else f.name
+                host_path = _host_export_path(f) if export_dir else f.name
                 files.append({
                     "filename": f.name,
                     "host_path": host_path,
@@ -2039,9 +2026,11 @@ async def setup_export_path(
     Ask the user where they want exports saved, then call this tool with their answer.
     This only needs to be done once — the setting persists across sessions."""
     try:
-        export_path = export_path.strip()
+        export_path = _expand(export_path.strip())
         if not export_path:
             raise ValueError("export_path is required")
+        if not _is_docker() and not os.path.isabs(export_path):
+            raise ValueError(f"export_path must be a full path, e.g. {Path.home() / 'influencer-exports'}")
 
         # Save to config file in the mounted volume
         config = {}
@@ -2072,7 +2061,7 @@ async def setup_export_path(
 # They're already @stdio_only_tool (absent in hosted mode); the handler below also omits them
 # from list_tools for other stdio clients so those clients don't surface tools they can't run.
 
-_BATCH_TOOLS = {"create_batch_enrichment", "get_batch_status", "download_batch_results", "resume_batch", "get_upload_url", "wait_for_upload", "list_import_files"}
+_BATCH_TOOLS = {"create_batch_enrichment", "get_batch_status", "resume_batch", "get_upload_url", "wait_for_upload", "list_import_files"}
 
 
 def _claude_code_error(tool_name: str) -> str:
