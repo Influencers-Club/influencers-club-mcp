@@ -12,7 +12,6 @@ if TYPE_CHECKING:
     from .api_client import InfluencersApiClient
 
 BATCH = f"{ROOT}/enrichment/batch/"
-RESULTS_TIMEOUT = 120.0  # a finished batch can be large
 
 
 def _batch_path(batch_id: str) -> str:
@@ -56,9 +55,9 @@ class BatchApi:
         """GET /enrichment/batch/{id}/status/ - progress of one job."""
         return await self._client.get(_batch_path(batch_id) + "status/")
 
-    async def results(self, batch_id: str) -> Any:
-        """GET /enrichment/batch/{id}/?format=json - the finished job's rows (the CSV format answers 404)."""
-        return await self._client.get(_batch_path(batch_id), {"format": "json"}, timeout=RESULTS_TIMEOUT)
+    async def download_link(self, batch_id: str) -> Any:
+        """GET /enrichment/batch/{id}/download/ - a short-lived link to the results CSV, with the counts."""
+        return await self._client.get(_batch_path(batch_id) + "download/")
 
     async def resume(self, batch_id: str) -> Any:
         """POST /enrichment/batch/{id}/resume/ - continue a job paused for lack of credits."""

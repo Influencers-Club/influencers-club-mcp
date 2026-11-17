@@ -2,14 +2,11 @@
 build itself: same verb, address, query, body and timeout for each operation."""
 
 import asyncio
-import csv
-import io
 import json
 
 import httpx
 import pytest
 
-from influencers_club_mcp import csv_export
 from influencers_club_mcp.api_account import AccountApi
 from influencers_club_mcp.api_batch import BatchApi
 from influencers_club_mcp.api_client import InfluencersApiClient
@@ -138,7 +135,7 @@ def test_batch():
     t.calls.clear()
     assert sent(api.status("abc-123"), t) == ("GET", f"{V1}/enrichment/batch/abc-123/status/", None, None, None)
     t.calls.clear()
-    assert sent(api.results("abc-123"), t) == ("GET", f"{V1}/enrichment/batch/abc-123/", {"format": "json"}, None, 120.0)
+    assert sent(api.download_link("abc-123"), t) == ("GET", f"{V1}/enrichment/batch/abc-123/download/", None, None, None)
     t.calls.clear()
     assert sent(api.resume("abc-123"), t) == ("POST", f"{V1}/enrichment/batch/abc-123/resume/", None, {}, None)
 
@@ -166,7 +163,7 @@ def test_content_and_account():
     [
         lambda: DiscoveryApi(Transport()).locations("instagram/../../accounts/credits"),
         lambda: BatchApi(Transport()).status("1/../../accounts/credits"),
-        lambda: BatchApi(Transport()).results("abc?format=csv"),
+        lambda: BatchApi(Transport()).download_link("abc?format=csv"),
         lambda: BatchApi(Transport()).resume(""),
         lambda: BatchApi(Transport()).status(".."),
         lambda: DiscoveryApi(Transport()).locations("."),
@@ -203,33 +200,6 @@ def test_the_real_client_carries_every_group(monkeypatch):
         ("GET", f"{V1}/enrichment/batch/b1/status/"),
         ("POST", f"{V1}/creators/content/posts/"),
         ("GET", f"{V1}/accounts/credits/"),
-    ]
-
-
-# --- the batch CSV helpers that moved here from server.py ---------------------
-
-
-SAMPLE = [
-    {"input_value": "a", "status": "ok", "result": {"email": "x@y", "tags": ["t1", "t2"], "stats": {"n": 1}, "none": None}},
-    {"handle": "missing", "status": "not_found"},
-    {"handle": "k", "status": "ok", "enrichment_data": {"first_name": "A", "instagram": {"username": "ig", "follower_count": 5}}},
-]
-
-
-def test_json_batch_to_csv_flattens_results_and_renames_input_value_to_handle():
-    rows = list(csv.DictReader(io.StringIO(csv_export.json_batch_to_csv(SAMPLE))))
-    assert rows[0] == {"status": "ok", "email": "x@y", "tags": '["t1", "t2"]', "stats.n": "1", "none": "", "handle": "a",
-                       "first_name": "", "instagram.username": "", "instagram.follower_count": ""}
-    assert rows[1]["handle"] == "missing" and rows[1]["status"] == "not_found"
-    assert rows[2]["instagram.follower_count"] == "5"
-    assert csv_export.json_batch_to_csv({"results": SAMPLE}) == csv_export.json_batch_to_csv(SAMPLE)
-    assert csv_export.json_batch_to_csv([]) == "" and csv_export.json_batch_to_csv("nope") == ""
-
-
-def test_preview_rows_skips_failed_rows_and_picks_platform_columns():
-    assert csv_export.preview_rows(SAMPLE) == [
-        {"handle": "a"},
-        {"handle": "k", "first_name": "A", "instagram.username": "ig", "instagram.follower_count": "5"},
     ]
 
 
@@ -343,3 +313,108 @@ def test_tools_still_reject_bad_input_before_any_request(monkeypatch):
     ]
     assert all(r["error"] is True for r in results)
     assert fake.calls == []
+
+
+def test_download_batch_results_link_on_hosted_file_on_local(monkeypatch, tmp_path):
+    from influencers_club_mcp import server
+    from influencers_club_mcp.api_client import ApiError
+
+    name, CSV = "batch_bch_1_enriched_results.csv", b"handle,status\r\nnike,ok\r\n"
+    link = {"download_url": "https://s3.example/r.csv?sig=1", "filename": name, "expires_at": "2026-01-01T00:00:00Z",
+            "total_results": 2, "invalid_records": 0}
+    fake = FakeClient(*[link] * 4)
+    monkeypatch.setattr(server, "client", fake)
+
+    def call():  # no client name is set: the tool is open to every client
+        return json.loads(asyncio.run(server.download_batch_results(batch_id=" bch_1 ")))
+
+    monkeypatch.setattr(server, "HTTP_MODE", True)  # hosted: the link and the counts, no rows
+    assert call() == link
+    assert fake.calls[0][:2] == ("GET", f"{V1}/enrichment/batch/bch_1/download/")
+
+    async def fetch(url, path):
+        assert url == link["download_url"]
+        path.write_bytes(CSV)
+
+    chosen, mount = tmp_path / "chosen", tmp_path / "mount"
+    monkeypatch.setattr(server, "HTTP_MODE", False)  # local: the server's CSV lands in the folder the user chose
+    monkeypatch.setattr(server, "OUTPUT_DIR", str(mount))
+    monkeypatch.setattr(server, "_get_export_host_dir", lambda: str(chosen))
+    monkeypatch.setattr(server, "_is_docker", lambda: False)
+    monkeypatch.setattr(fake, "download_file", fetch, raising=False)
+    out = call()
+    assert out["file"] == str(chosen / name) and out["total_results"] == 2 and "preview" not in out
+    assert (chosen / name).read_bytes() == CSV and not mount.exists()
+    (chosen / name).write_bytes(b"edited")  # a second download keeps the first file
+    again = call()["file"]
+    assert again != out["file"] and (chosen / name).read_bytes() == b"edited"
+
+    monkeypatch.setattr(server, "_is_docker", lambda: True)  # Docker: written to the mount, reported as the host path
+    assert call()["file"] == str(chosen / name) and (mount / name).read_bytes() == CSV
+
+    async def not_ready(batch_id):
+        raise ApiError(400, "not generated yet", code="results_not_ready")
+
+    monkeypatch.setattr(fake.batch, "download_link", not_ready)  # no results file yet: not an error, not "retry"
+    out = call()
+    assert out["status"] == "results_not_ready" and "error" not in out and "retryable" not in out
+
+
+def test_host_export_path_keeps_the_host_style(monkeypatch):
+    from pathlib import Path
+    from influencers_club_mcp import server
+
+    monkeypatch.setattr(server, "_is_docker", lambda: True)  # Linux server, host folder in its own style
+    monkeypatch.setattr(server, "OUTPUT_DIR", "/exports")
+    for host, want in ((r"C:\Users\x\exports", r"C:\Users\x\exports\b.csv"), ("/Users/ana/exports", "/Users/ana/exports/b.csv")):
+        monkeypatch.setattr(server, "_get_export_host_dir", lambda h=host: h)
+        assert server._host_export_path(Path("/exports") / "b.csv") == want
+
+
+def test_batch_from_a_full_path_uses_that_file_not_a_same_named_one(monkeypatch, tmp_path):
+    from influencers_club_mcp import server
+
+    chosen, old = tmp_path / "chosen", tmp_path / "old"
+    for folder, handle in ((chosen, "wrong"), (old, "right"), (tmp_path / "imports", "wrong")):
+        folder.mkdir()
+        (folder / "list.csv").write_bytes(f"handle\n{handle}\n".encode())
+    monkeypatch.setattr(server, "_is_docker", lambda: False)
+    monkeypatch.setattr(server, "_get_export_host_dir", lambda: str(chosen))
+    monkeypatch.setattr(server, "OUTPUT_DIR", str(old))
+    monkeypatch.setattr(server, "IMPORTS_DIR", str(tmp_path / "imports"))
+    monkeypatch.setattr(server, "_get_mcp_client_name", lambda: "claude-code")
+    fake = FakeClient()
+    monkeypatch.setattr(server, "client", fake)
+
+    asyncio.run(server.create_batch_enrichment(enrichment_mode="raw", platform="instagram", csv_file_path=str(old / "list.csv")))
+    assert fake.calls[0][3]["file"][1] == b"handle\nright\n"
+
+
+def test_setup_export_path_refuses_a_relative_folder(monkeypatch, tmp_path):
+    from influencers_club_mcp import server
+
+    monkeypatch.setattr(server, "_is_docker", lambda: False)
+    monkeypatch.setattr(server, "CONFIG_FILE", str(tmp_path / ".ic_config.json"))
+    out = json.loads(asyncio.run(server.setup_export_path(export_path=r"Desktop\exports")))
+    assert out["error"] and "full path" in out["message"] and not (tmp_path / ".ic_config.json").exists()
+
+
+def test_download_file_streams_and_never_shows_the_link(tmp_path):
+    def handler(request):
+        return httpx.Response(200 if request.url.params.get("ok") else 403, content=b"a,b\n1,2\n")
+
+    client = InfluencersApiClient()
+    client._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    target = tmp_path / "r.csv"
+    asyncio.run(client.download_file("https://s3.test/r.csv?ok=1&Signature=s", target))
+    assert target.read_bytes() == b"a,b\n1,2\n"
+    target.unlink()
+    with pytest.raises(Exception) as err:
+        asyncio.run(client.download_file("https://s3.test/r.csv?Signature=secret", target))
+    assert "secret" not in str(err.value) and not target.exists()
+
+
+def test_api_error_keeps_the_error_code():
+    resp = httpx.Response(400, json={"error": "x", "error_code": "results_not_ready"}, request=httpx.Request("GET", "http://t"))
+    err = InfluencersApiClient()._handle_error(httpx.HTTPStatusError("boom", request=resp.request, response=resp))
+    assert (err.status, err.code) == (400, "results_not_ready")
