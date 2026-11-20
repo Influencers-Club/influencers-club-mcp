@@ -590,6 +590,12 @@ def _get_mcp_client_name() -> str:
     return params.clientInfo.name if params is not None else ""
 
 
+_HAS_EMAIL_DESC = (
+    "When `true`, only creators we have an email for are returned. "
+    "When `false` or left out, creators without an email are included too."
+)
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # 1. DISCOVER CREATORS
 # ═══════════════════════════════════════════════════════════════════════
@@ -605,6 +611,7 @@ async def discover_creators(
     sort_order: Annotated[str, Field(description="Sort direction: asc or desc (relevancy only supports desc)")] = "desc",
     ai_search: Annotated[Optional[str], Field(description="AI-powered semantic search for niche/topic queries (3-150 chars). Short queries work best (e.g., 'fitness', 'retro gaming'). For topical searches keep sort_by=relevancy and constrain size with the number_of_followers filter — sorting by followers ranks the biggest matches, not the most relevant.")] = None,
     filters: Annotated[Optional[DiscoveryFilters], Field(description="Structured filters — every legal filter is a property of this object. Some fields apply only to certain platforms.")] = None,
+    has_email: Annotated[Optional[bool], Field(description=_HAS_EMAIL_DESC)] = None,
 ) -> str:
     """Search the Influencers.club database to discover creators/influencers. Returns profiles with basic stats.
     Costs 0.01 credits per creator returned.
@@ -621,7 +628,9 @@ async def discover_creators(
             ai_search = _validate_ai_search(ai_search)
             f["ai_search"] = ai_search
 
-        result = await client.discovery.search(platform, f, page=page, limit=limit, sort_by=sort_by, sort_order=sort_order)
+        result = await client.discovery.search(
+            platform, f, page=page, limit=limit, sort_by=sort_by, sort_order=sort_order, has_email=has_email
+        )
         return json.dumps(result, indent=2)
     except Exception as e:
         return _error_response(e)
@@ -641,6 +650,7 @@ async def discover_creators_to_file(
     sort_order: Annotated[str, Field(description="Sort direction: asc or desc (relevancy only supports desc)")] = "desc",
     ai_search: Annotated[Optional[str], Field(description="AI-powered semantic search (3-150 chars). Can be combined with any sort_by.")] = None,
     filters: Annotated[Optional[DiscoveryFilters], Field(description="Structured filters (same schema as discover_creators)")] = None,
+    has_email: Annotated[Optional[bool], Field(description=_HAS_EMAIL_DESC)] = None,
     filename: Annotated[Optional[str], Field(description="Optional custom filename (without extension). Defaults to auto-generated.")] = None,
 ) -> str:
     """Search creators and save results directly to a CSV file on disk. Fetches multiple pages automatically
@@ -669,7 +679,9 @@ async def discover_creators_to_file(
         total_available = 0
 
         for page in range(0, total_pages):
-            result = await client.discovery.search(platform, f, page=page, limit=50, sort_by=sort_by, sort_order=sort_order)
+            result = await client.discovery.search(
+                platform, f, page=page, limit=50, sort_by=sort_by, sort_order=sort_order, has_email=has_email
+            )
 
             accounts = result.get("accounts", [])
             if accounts:
@@ -725,6 +737,7 @@ async def find_similar_creators(
     filter_key: Annotated[str, Field(description='How to identify the creator: "url", "username", or "id"')] = "username",
     filter_value: Annotated[str, Field(description="The creator's URL, username, or platform ID")] = "",
     filters: Annotated[Optional[DiscoveryFilters], Field(description="Structured filters (same schema as discover_creators)")] = None,
+    has_email: Annotated[Optional[bool], Field(description=_HAS_EMAIL_DESC)] = None,
     page: Annotated[int, Field(description="Page number (0-indexed, first page = 0)", ge=0)] = 0,
     limit: Annotated[int, Field(description="Results per page (1-50)", ge=1, le=50)] = 20,
 ) -> str:
@@ -742,7 +755,9 @@ async def find_similar_creators(
         f = _map_follower_filter(f, platform)
         await _check_exclusion_lists(f, platform)
 
-        result = await client.discovery.similar(platform, filter_key, filter_value, f, page=page, limit=limit)
+        result = await client.discovery.similar(
+            platform, filter_key, filter_value, f, page=page, limit=limit, has_email=has_email
+        )
         return json.dumps(result, indent=2)
     except Exception as e:
         return _error_response(e)

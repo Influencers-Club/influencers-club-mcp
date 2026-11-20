@@ -32,19 +32,37 @@ class DiscoveryApi:
         self._client = client
 
     async def search(
-        self, platform: str, filters: dict[str, Any], *, page: int, limit: int, sort_by: str, sort_order: str
+        self,
+        platform: str,
+        filters: dict[str, Any],
+        *,
+        page: int,
+        limit: int,
+        sort_by: str,
+        sort_order: str,
+        has_email: Optional[bool] = None,
     ) -> Any:
         """POST /discovery/ - one page of creators; costs credits per creator returned."""
-        body = {
+        body: dict[str, Any] = {
             "platform": platform,
             "paging": {"limit": limit, "page": page},
             "sort": {"sort_by": sort_by, "sort_order": sort_order},
             "filters": filters if filters else None,
         }
+        if has_email is not None:
+            body["has_email"] = has_email
         return await self._client.post(DISCOVERY, body)
 
     async def similar(
-        self, platform: str, filter_key: str, filter_value: str, filters: dict[str, Any], *, page: int, limit: int
+        self,
+        platform: str,
+        filter_key: str,
+        filter_value: str,
+        filters: dict[str, Any],
+        *,
+        page: int,
+        limit: int,
+        has_email: Optional[bool] = None,
     ) -> Any:
         """POST /discovery/creators/similar/ - creators similar to one reference creator."""
         body: dict[str, Any] = {
@@ -55,6 +73,8 @@ class DiscoveryApi:
         }
         if filters:
             body["filters"] = filters
+        if has_email is not None:
+            body["has_email"] = has_email
         return await self._client.post(f"{DISCOVERY}creators/similar/", body)
 
     async def audience_overlap(self, platform: str, creators: list[str]) -> Any:

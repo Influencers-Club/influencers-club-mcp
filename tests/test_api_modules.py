@@ -61,6 +61,11 @@ def test_discovery_search_and_similar():
     )
     t.calls.clear()
     assert sent(api.similar("youtube", "url", "u", f, page=1, limit=1), t)[3]["filters"] == f
+    t.calls.clear()
+    search = api.search("tiktok", {}, page=0, limit=5, sort_by="relevancy", sort_order="desc", has_email=True)
+    assert sent(search, t)[3]["has_email"] is True
+    t.calls.clear()
+    assert sent(api.similar("youtube", "username", "nike", {}, page=0, limit=10, has_email=False), t)[3]["has_email"] is False
 
 
 def test_discovery_overlap_and_lookups():
@@ -299,6 +304,26 @@ def test_tools_send_through_the_endpoint_groups(monkeypatch):
     assert search["filters"] == {"number_of_followers": {"min": 10}}
     assert fake.calls[2][2] == {"search": "nike", "offset": "20"}
     assert fake.calls[5][3] == {"platform": "youtube", "handle": "nike", "count": 5}
+
+
+def test_discovery_tools_send_has_email_only_when_set(monkeypatch, tmp_path):
+    from influencers_club_mcp import server
+
+    fake = FakeClient()
+    monkeypatch.setattr(server, "client", fake)
+    monkeypatch.setattr(server, "_export_write_dir", lambda: tmp_path)
+
+    async def scenario():
+        await server.discover_creators(platform="instagram")
+        await server.discover_creators(platform="instagram", has_email=True)
+        await server.find_similar_creators(platform="tiktok", filter_value="nike")
+        await server.find_similar_creators(platform="tiktok", filter_value="nike", has_email=True)
+        await server.discover_creators_to_file(platform="instagram", has_email=True)
+
+    asyncio.run(scenario())
+    bodies = [c[3] for c in fake.calls]
+    assert ["has_email" in body for body in bodies] == [False, True, False, True, True]
+    assert all(body["has_email"] is True for body in bodies if "has_email" in body)
 
 
 def test_tools_still_reject_bad_input_before_any_request(monkeypatch):
