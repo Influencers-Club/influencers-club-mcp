@@ -27,7 +27,7 @@ from pydantic import BeforeValidator, Field
 from .api_client import ApiError, InfluencersApiClient
 from .auth import IntrospectionUnavailableMiddleware
 from .csv_export import creators_to_csv
-from .csv_import import count_csv_rows, mostly_emails, to_single_column
+from .csv_import import count_csv_rows, mostly_emails
 from .discovery_filters import DiscoveryFilters, coerce_filters
 from .enrich_results import (
     ENRICH_ANALYTICS_SECTIONS,
@@ -148,7 +148,7 @@ BATCH_ENRICHMENT_UNSUPPORTED_FIELDS = {
 CREDIT_COSTS = {
     "discovery": 0.01, "similar": 0.01, "overlap": 1, "socials": 0.5,
     "handle_raw": 0.03, "handle_full": 1, "email_basic": 0.05,
-    "posts": 0.15, "post_detail": 0.03,
+    "posts": 0.03, "post_detail": 0.03,
 }
 
 # Claude Code parks a tool result over ~25k tokens in a file instead of showing
@@ -219,7 +219,7 @@ if HTTP_MODE:
         _mcp_kwargs["auth"] = _auth_settings
 
 # Server-level instructions. The hosted (HTTP) variant must only describe tools that
-# actually exist in hosted mode — file tools and every batch tool but the download are
+# actually exist in hosted mode — file tools and the batch upload tools are
 # stdio-only, so their sections are appended only for stdio. Keep wording descriptive (what tools do), not behavioral.
 _INSTRUCTIONS_CORE = (
     "MCP server for the Influencers Club API: creator discovery, enrichment, and content analytics.\n\n"
@@ -242,17 +242,19 @@ _INSTRUCTIONS_CORE = (
     "(get_default_exclusion_list, get_default_exclusion_list_handles, add_to_default_exclusion_list, "
     "remove_from_default_exclusion_list). A list only affects a search when the discover_creators or "
     "find_similar_creators filters carry exclude_list (ids), exclude_default_list or exclude_all_lists.\n\n"
+    "Bulk enrichment runs as batch jobs: create_batch_enrichment starts one from up to 200 handles or "
+    "emails passed in 'values' (first call returns a mode menu; a second call with the chosen mode "
+    "starts it), get_batch_status reports progress, resume_batch continues a paused one, and "
     "download_batch_results returns a finished batch's results as a CSV: a download link on the hosted "
-    "server, a saved file on a local install. A link expires; call the tool again for a fresh one.\n"
+    "server, a saved file on a local install. A link expires; call the tool again for a fresh one. "
+    "A batch keeps running on the server between checks.\n"
 )
 
 _INSTRUCTIONS_STDIO_EXTRAS = (
     "\nLocal-only tools (this stdio session): discover_creators_to_file saves discovery results "
-    "to CSV on disk. Bulk enrichment runs as batch jobs: get_upload_url provides the CSV upload "
-    "page, wait_for_upload blocks until the file lands, create_batch_enrichment starts the job "
-    "(first call returns a mode menu; a second call with the chosen mode starts it), "
-    "get_batch_status reports progress, and download_batch_results saves the results CSV. "
-    "The uploaded CSV needs a 'handle' or 'email' header.\n"
+    "to CSV on disk. A bigger batch starts from a CSV file: get_upload_url provides the CSV upload "
+    "page, wait_for_upload blocks until the file lands, and create_batch_enrichment takes the file "
+    "as csv_file_path. The uploaded CSV needs a 'handle' or 'email' header.\n"
 )
 
 class _FastMCP(FastMCP):
@@ -1179,10 +1181,8 @@ async def connected_socials(
         return _error_response(e)
 
 
-# Bulk-enrichment hint is stdio-only: create_batch_enrichment is a @stdio_only_tool and is
-# NOT registered in hosted (HTTP) mode, so hosted tool descriptions must not point at it.
 def _bulk_enrich_hint(items: str) -> str:
-    return "" if HTTP_MODE else f" For bulk (more than ~10 {items}), use create_batch_enrichment."
+    return f" For bulk (more than ~10 {items}), use create_batch_enrichment."
 
 
 def _as_list(value: Any) -> Any:
@@ -1253,8 +1253,7 @@ async def enrich_by_handle(
     ))] = None,
     detail: Annotated[Detail, BeforeValidator(_compact_when_null), Field(description=_DETAIL_DOC)] = "compact",
 ) -> str:
-    """Enrich ONE creator by handle (full data). Costs 1 credit. Client-facing description is set
-    on the decorator so the bulk hint can be omitted in hosted mode (no create_batch_enrichment)."""
+    """Enrich ONE creator by handle (full data). Costs 1 credit. The client-facing description is on the decorator."""
     try:
         platform = _validate_platform(platform, ENRICH_FULL_PLATFORMS)
         handle = _validate_handle(handle)
@@ -1400,14 +1399,17 @@ async def enrich_by_email(
 # ═══════════════════════════════════════════════════════════════════════
 # 18. CREATE BATCH ENRICHMENT
 # ═══════════════════════════════════════════════════════════════════════
-@stdio_only_tool(
+INLINE_BATCH_MAX = 200  # handles or emails one call may carry in 'values'
+
+
+@mcp.tool(
     name="create_batch_enrichment",
     annotations={"title": "Create Batch Enrichment", "readOnlyHint": False, "destructiveHint": False, "openWorldHint": True},
 )
 async def create_batch_enrichment(
     enrichment_mode: Annotated[str, Field(description="Leave EMPTY on first call — server returns mode menu. Options: basic (0.05/record, emails), raw (0.03/record, handles), full (1/record, handles).")] = "",
-    csv_content: Annotated[str, Field(description='ONLY for small inline lists (under 20 entries). NEWLINE-separated with header. Example: "email\\nfoo@bar.com\\nbaz@qux.com".')] = "",
-    csv_file_path: Annotated[Optional[str], Field(description="Path to CSV in the imports folder. Get from list_import_files after upload. NEVER construct paths yourself.")] = None,
+    values: Annotated[Optional[list[str]], Field(description=f"Handles or emails from the chat, one per item, no header. Up to {INLINE_BATCH_MAX}.", max_length=INLINE_BATCH_MAX), BeforeValidator(_as_list)] = None,  # after Field, or the schema says maxLength
+    csv_file_path: Annotated[Optional[str], Field(description="Local install only. Path to CSV in the imports folder. Get from list_import_files after upload. NEVER construct paths yourself.")] = None,
     platform: Annotated[Optional[str], Field(description="Required for handle-based modes (raw, full). Allowed: instagram, youtube, tiktok, twitter, twitch, onlyfans")] = None,
     email_required: Annotated[Optional[str], Field(description="For handle modes only: must_have or preferred")] = None,
     include_lookalikes: Annotated[Optional[bool], Field(description="For handle full mode only")] = None,
@@ -1416,19 +1418,23 @@ async def create_batch_enrichment(
     exclude_platforms: Annotated[Optional[Any], Field(description="Not supported — do not pass. Rejected with an error explaining why.")] = None,
     min_followers: Annotated[Optional[Any], Field(description="Not supported — do not pass. Rejected with an error explaining why.")] = None,
 ) -> str:
-    """Create a batch enrichment job. Upload a CSV with up to 10,000 handles or emails.
+    """Create a batch enrichment job for a list of handles or emails. Results come from download_batch_results.
 
-    On Claude Desktop / claude.ai, call this with no parameters when the user provides a CSV or list —
-    the server responds with the right next step for that client.
+    Leave enrichment_mode empty on the first call — the server returns a mode menu to choose from.
 
-    In Claude Code:
-    1. Leave enrichment_mode empty on the first call — the server returns a mode menu to choose from.
-    2. 100+ entries: get_upload_url → user uploads → wait_for_upload → csv_file_path.
-    3. Fewer entries can also be enriched one at a time with the single-profile tools.
-    4. Use csv_content only for small inline lists typed in chat, not for dropped/attached files."""
+    Input, one of:
+    - values: up to 200 handles or emails taken from the chat. A longer list can be split into
+      several batches; the API runs only a few at a time, so send the rest when one finishes.
+      Beyond about 1,000 entries a file is the better input: csv_file_path on a local install,
+      or the Influencers Club dashboard.
+    - csv_file_path (local install only): a CSV with a 'handle' or 'email' header, up to 10,000 rows.
+    A few entries can also be enriched one at a time with the single-profile tools."""
     try:
-        if "claude-code" not in _get_mcp_client_name().lower():
-            return _claude_code_error("create_batch_enrichment")
+        if HTTP_MODE and csv_file_path:  # a path here would be a file on the server, never the user's
+            raise ValueError("csv_file_path works only on a local install. Pass the handles or emails in 'values'.")
+        values = [v.strip() for v in values or [] if v.strip()]
+        if any(c in v for v in values for c in ',;" \t\n\r'):
+            raise ValueError("Each item in 'values' must be one handle or email.")
         if exclude_platforms is not None:
             raise ValueError(BATCH_ENRICHMENT_UNSUPPORTED_FIELDS["exclude_platforms"])
         if min_followers is not None:
@@ -1448,8 +1454,8 @@ async def create_batch_enrichment(
                         if try_path.exists():
                             peek_text = try_path.read_text(encoding="utf-8", errors="replace")
                             break
-                elif csv_content and csv_content.strip():
-                    peek_text = csv_content.strip()
+                elif values:
+                    detected_input = "email" if mostly_emails(values) else "handle"
                 if peek_text:
                     first_line = peek_text.strip().split("\n")[0].strip().lower().replace('"', '').replace("'", "")
                     # Check header or first column headers for email/handle
@@ -1499,7 +1505,7 @@ async def create_batch_enrichment(
         if platform:
             platform = _validate_platform(platform, ENRICHMENT_PLATFORMS)
 
-        # Get CSV bytes — from file path or inline string content
+        # Get CSV bytes — from file path or the inline list
         csv_bytes: bytes | None = None
 
         # Priority 1: File path (checks /imports first, then /exports)
@@ -1536,35 +1542,14 @@ async def create_batch_enrichment(
             if container_path.exists():
                 csv_bytes = container_path.read_bytes()
             else:
-                raise ValueError(
-                    f"File not found: {host_path}. "
-                    f"Upload via the browser page at http://localhost:{UPLOAD_PORT} first, "
-                    f"then call list_import_files to get the correct path."
-                )
+                raise ValueError(f"File not found: {host_path}. Check the path, or pass the handles or emails in 'values'.")
 
-        # Priority 2: Inline CSV string (small lists only, <20 entries)
+        # Priority 2: the inline list. Its values name the column, so the API refuses a mode that doesn't fit them.
         if csv_bytes is None:
-            csv_content = csv_content.strip()
-            if csv_content:
-                # Space-separated with no newlines → split into lines
-                if "\n" not in csv_content and " " in csv_content:
-                    parts = csv_content.split()
-                    csv_content = "\n".join(parts)
-
-                lines = [l.strip() for l in csv_content.strip().split("\n") if l.strip()]
-                line_count = len(lines)
-                if line_count > 25:
-                    raise ValueError(
-                        f"Too many rows ({line_count}) for inline csv_content. Maximum is 20. "
-                        f"Upload via http://localhost:{UPLOAD_PORT} then use list_import_files."
-                    )
-
-                # Ensure proper single-column CSV with handle/email header
-                fixed = to_single_column(lines, first_line_is_header=False)
-                csv_content = "\n".join(fixed[0] if fixed else lines)
-                csv_bytes = csv_content.encode("utf-8")
-            else:
-                raise ValueError("Provide csv_file_path or csv_content.")
+            if not values:
+                raise ValueError("Provide values or csv_file_path.")
+            header = "email" if mostly_emails(values) else "handle"
+            csv_bytes = "\n".join([header, *values]).encode("utf-8")
 
         # Detect duplicates and warn (each duplicate costs credits)
         duplicate_warning = ""
@@ -1597,8 +1582,8 @@ async def create_batch_enrichment(
             if duplicate_warning:
                 result["duplicate_warning"] = duplicate_warning
             result["_auto_action"] = (
-                "Batch submitted. Tell the user the batch_id and that you'll monitor progress. "
-                "If there's a 'duplicate_warning', show it first, then poll get_batch_status with this batch_id."
+                "Batch submitted. Tell the user the batch_id. If there's a 'duplicate_warning', "
+                "show it first, then check get_batch_status with this batch_id."
             )
         return json.dumps(result, indent=2)
     except Exception as e:
@@ -1608,38 +1593,37 @@ async def create_batch_enrichment(
 # ═══════════════════════════════════════════════════════════════════════
 # 19. BATCH STATUS (with server-side rate limiting)
 # ═══════════════════════════════════════════════════════════════════════
-_batch_poll_cache: dict[str, tuple[float, dict]] = {}  # batch_id -> (timestamp, result)
+_batch_poll_cache: dict[str, float] = {}  # batch_id -> time of the last poll
 POLL_INTERVAL = 35  # seconds
+API_POLL_INTERVAL = 30  # seconds the API itself wants between two polls of one batch
 POLL_CACHE_TTL = 600  # 10 minutes — evict stale entries from abandoned batches
 
 
 def _evict_stale_polls() -> None:
     """Remove poll cache entries older than POLL_CACHE_TTL to prevent unbounded growth."""
     now = _time.time()
-    stale = [bid for bid, (ts, _) in _batch_poll_cache.items() if now - ts > POLL_CACHE_TTL]
+    stale = [bid for bid, ts in _batch_poll_cache.items() if now - ts > POLL_CACHE_TTL]
     for bid in stale:
         _batch_poll_cache.pop(bid, None)
 
 
-@stdio_only_tool(
+@mcp.tool(
     name="get_batch_status",
     annotations={"title": "Get Batch Status", "readOnlyHint": True, "destructiveHint": False, "openWorldHint": True},
 )
 async def get_batch_status(
     batch_id: Annotated[str, Field(description="Batch job ID from create_batch_enrichment")],
 ) -> str:
-    """Check the status of a batch enrichment job. Claude Code only. Free (0 credits).
+    """Check the status of a batch enrichment job. Free (0 credits).
 
-    On other clients, use create_batch_enrichment (with no parameters) instead.
-
-    The server waits 35s between polls internally. Handling by status:
-    - 'processing': report progress and poll again.
+    The server waits about 35s between two checks of one batch. By status:
+    - 'processing': still running. 'estimated_completion' is the expected finish time, once some
+      rows are processed. The batch keeps running on the server between checks, so a long one
+      can be checked again later with the same batch_id.
     - 'finished': call download_batch_results.
     - 'paused_insufficient_credits': tell the user and offer resume_batch."""
     import time
     try:
-        if "claude-code" not in _get_mcp_client_name().lower():
-            return _claude_code_error("get_batch_status")
         batch_id = batch_id.strip()
         if not batch_id:
             raise ValueError("batch_id is required")
@@ -1651,15 +1635,21 @@ async def get_batch_status(
 
         # Block until poll interval has passed — prevents Claude from spamming
         if batch_id in _batch_poll_cache:
-            last_time, _last_result = _batch_poll_cache[batch_id]
-            wait_remaining = POLL_INTERVAL - (now - last_time)
+            wait_remaining = POLL_INTERVAL - (now - _batch_poll_cache[batch_id])
             if wait_remaining > 0:
                 await asyncio.sleep(wait_remaining)
 
-        result = await client.batch.status(batch_id)
+        try:
+            result = await client.batch.status(batch_id)
+        except ApiError as e:
+            if e.code != "polling_too_frequent":
+                raise
+            # Another server instance checked this batch a moment ago: wait it out here.
+            await asyncio.sleep(API_POLL_INTERVAL)
+            result = await client.batch.status(batch_id)
 
         # Cache with current time AFTER the API call (not before sleep)
-        _batch_poll_cache[batch_id] = (time.time(), result)
+        _batch_poll_cache[batch_id] = time.time()
 
         # Clean finished batches from cache and add auto-action hints
         if isinstance(result, dict):
@@ -1671,8 +1661,18 @@ async def get_batch_status(
                 )
             elif status == "processing":
                 result["_auto_action"] = (
-                    "Still processing. Report progress, then poll get_batch_status again after ~35 seconds."
+                    "Still processing. Report progress. The batch keeps running without polling: "
+                    "check again now when it is close to done, or later with the same batch_id when "
+                    "'estimated_completion' is far off or still empty after a second check."
                 )
+            elif status == "queued":
+                result["_auto_action"] = (
+                    "Queued: it starts when one of the account's running batches finishes. "
+                    "Report that, and check again later with the same batch_id."
+                )
+            elif status == "failed":
+                _batch_poll_cache.pop(batch_id, None)
+                result["_auto_action"] = "Batch failed. Tell the user; the list can be sent again as a new batch."
             elif status == "paused_insufficient_credits":
                 _batch_poll_cache.pop(batch_id, None)
                 result["_auto_action"] = (
@@ -1745,19 +1745,15 @@ async def download_batch_results(
 # ═══════════════════════════════════════════════════════════════════════
 # 21. RESUME BATCH
 # ═══════════════════════════════════════════════════════════════════════
-@stdio_only_tool(
+@mcp.tool(
     name="resume_batch",
     annotations={"title": "Resume Batch", "readOnlyHint": False, "destructiveHint": False, "openWorldHint": True},
 )
 async def resume_batch(
     batch_id: Annotated[str, Field(description="Batch job ID to resume")],
 ) -> str:
-    """Resume a paused batch enrichment job. Claude Code only. Free (0 credits).
-
-    On other clients, use create_batch_enrichment (with no parameters) instead."""
+    """Resume a paused batch enrichment job. Free (0 credits)."""
     try:
-        if "claude-code" not in _get_mcp_client_name().lower():
-            return _claude_code_error("resume_batch")
         batch_id = batch_id.strip()
         if not batch_id:
             raise ValueError("batch_id is required")
@@ -1781,7 +1777,7 @@ async def get_creator_posts(
     pagination_token: Annotated[Optional[str], Field(description="Pass the 'next_token' value from the previous response to fetch the next page")] = None,
 ) -> str:
     """Get recent posts/content from a creator. Supports Instagram (12/page), TikTok (max 35), YouTube (max 50).
-    Uses cursor-based pagination. Costs 0.15 credits per request."""
+    Uses cursor-based pagination. Costs 0.03 credits per request."""
     try:
         platform = _validate_platform(platform, CONTENT_PLATFORMS)
         handle = _validate_handle(handle)
@@ -1849,8 +1845,6 @@ async def check_credits() -> str:
 async def get_upload_url() -> str:
     """Get the upload page URL for batch CSV upload. Claude Code only.
 
-    On other clients, use create_batch_enrichment (with no parameters) instead.
-
     After getting the URL, show it to the user and call wait_for_upload in the same response —
     the user opens the link and uploads the file themselves (no browser automation needed)."""
     try:
@@ -1889,8 +1883,6 @@ async def get_upload_url() -> str:
 )
 async def wait_for_upload() -> str:
     """Wait for a file to be uploaded via the upload page. Claude Code only.
-
-    On other clients, use create_batch_enrichment (with no parameters) instead.
 
     Polls every 2 seconds for up to 3 minutes; call it right after get_upload_url.
     Returns the uploaded file details when detected. Free (0 credits)."""
@@ -1950,8 +1942,6 @@ async def wait_for_upload() -> str:
 )
 async def list_import_files() -> str:
     """List uploaded CSV files ready for batch enrichment. Claude Code only. Free (0 credits).
-
-    On other clients, use create_batch_enrichment (with no parameters) instead.
 
     Shows the 5 most recent uploads. Use host_path as csv_file_path in create_batch_enrichment."""
     try:
@@ -2060,12 +2050,12 @@ async def setup_export_path(
         return _error_response(e)
 
 
-# ─── Batch-tool availability (stdio only) ──────────────────────────────
-# Batch/file tools need the local file-upload flow, so they're offered only to Claude Code.
+# ─── Upload-tool availability (stdio only) ─────────────────────────────
+# The upload-page tools need the local file-upload flow, so they're offered only to Claude Code.
 # They're already @stdio_only_tool (absent in hosted mode); the handler below also omits them
 # from list_tools for other stdio clients so those clients don't surface tools they can't run.
 
-_BATCH_TOOLS = {"create_batch_enrichment", "get_batch_status", "resume_batch", "get_upload_url", "wait_for_upload", "list_import_files"}
+_BATCH_TOOLS = {"get_upload_url", "wait_for_upload", "list_import_files"}
 
 
 def _claude_code_error(tool_name: str) -> str:
@@ -2081,10 +2071,10 @@ def _claude_code_error(tool_name: str) -> str:
     })
 
 
-# ─── Omit batch tools from list_tools for non-Claude Code clients ───────
-# Progressive disclosure: clients that don't support the file-drop flow don't see batch
+# ─── Omit upload tools from list_tools for non-Claude Code clients ──────
+# Progressive disclosure: clients that don't support the file-drop flow don't see the upload
 # tools. Popping the cache drops their stored schema; the call-time gate is the
-# _claude_code_error check inside each batch tool, not the cache removal.
+# _claude_code_error check inside each upload tool, not the cache removal.
 
 import mcp.types as _mcp_types
 
@@ -2098,7 +2088,7 @@ async def _filtered_list_tools_handler(req: _mcp_types.ListToolsRequest):
     if "claude-code" in client:
         return result  # Claude Code sees everything
 
-    # Non-Claude Code: filter batch tools from the result and cache
+    # Non-Claude Code: filter the upload tools from the result and cache
     tools_result = result.root  # ServerResult wraps ListToolsResult
     original_count = len(tools_result.tools)
     tools_result.tools = [t for t in tools_result.tools if t.name not in _BATCH_TOOLS]
