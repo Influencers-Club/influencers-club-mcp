@@ -449,7 +449,7 @@ class UploadHandler(BaseHTTPRequestHandler):
 
             # Auto-detect column with emails/handles, fix header, strip to single column
             try:
-                fixed = to_single_column(lines, first_line_is_header=True)
+                fixed = to_single_column(lines)
             except ValueError as e:
                 self._send_json(400, {'error': True, 'message': str(e)})
                 return

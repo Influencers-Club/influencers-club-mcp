@@ -24,7 +24,7 @@ The hosted server runs at `https://mcp-dashboard.influencers.club/mcp` and signs
 **Requirements:** an [Influencers Club](https://influencers.club) account with API credits. Discovery and enrichment tools consume credits (costs are listed on every tool and in the tables below); dictionary/lookup tools are free.
 
 **Notes:**
-- The hosted connector exposes the API tools. File and batch tools (CSV export, bulk CSV enrichment) need a local filesystem and are available only in the [local install](#local-install-stdio).
+- The hosted connector exposes the API tools, including batch enrichment of a list of handles or emails. File tools (CSV export, batch enrichment from a CSV file) need a local filesystem and are available only in the [local install](#local-install-stdio).
 - **Connection expired / 401 errors:** disconnect and reconnect the connector to re-authenticate.
 - **"Insufficient credits" errors:** top up in the [dashboard](https://dashboard.influencers.club); calls keep failing until the balance is positive.
 
@@ -218,15 +218,15 @@ Team-shared blocklists of creator handles: one default list per platform plus an
 
 | Tool | Description | Cost |
 |---|---|---|
-| `get_creator_posts` | Fetch recent posts with engagement metrics (IG, TikTok, YouTube) | 0.15 credits |
+| `get_creator_posts` | Fetch recent posts with engagement metrics (IG, TikTok, YouTube) | 0.03 credits |
 | `get_post_details` | Deep content analysis (comments, transcript, audio) | 0.03 credits |
 
-### Batch Enrichment *(local only)*
+### Batch Enrichment
 
 | Tool | Description | Cost |
 |---|---|---|
-| `create_batch_enrichment` | Upload CSV of up to 10,000 handles/emails for bulk processing | varies |
-| `get_batch_status` | Check batch job progress (auto-polls every 35s) | free |
+| `create_batch_enrichment` | Bulk enrichment: up to 200 handles/emails passed as a list, or a CSV of up to 10,000 on a local install | per row: 0.05 (emails), 0.03 raw or 1 full (handles) |
+| `get_batch_status` | Check batch job progress | free |
 | `download_batch_results` | Batch results as CSV: saved to disk locally, a download link on the hosted server | free |
 | `resume_batch` | Resume a paused batch after adding credits | free |
 

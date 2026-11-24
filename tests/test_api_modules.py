@@ -256,7 +256,6 @@ def test_tools_send_through_the_endpoint_groups(monkeypatch):
         await server.enrich_by_handle(handle="nike", platform="instagram", email_required="must_have")
         await server.enrich_by_email(email="A@B.co")
         await server.get_post_details(platform="youtube", post_id="vid1", content_type="transcript", pagination_token="t2")
-        monkeypatch.setattr(server, "_get_mcp_client_name", lambda: "claude-code")
         await server.get_batch_status(batch_id=" bch_1 ")
         await server.resume_batch(batch_id="bch_1")
 
@@ -407,12 +406,94 @@ def test_batch_from_a_full_path_uses_that_file_not_a_same_named_one(monkeypatch,
     monkeypatch.setattr(server, "_get_export_host_dir", lambda: str(chosen))
     monkeypatch.setattr(server, "OUTPUT_DIR", str(old))
     monkeypatch.setattr(server, "IMPORTS_DIR", str(tmp_path / "imports"))
-    monkeypatch.setattr(server, "_get_mcp_client_name", lambda: "claude-code")
     fake = FakeClient()
     monkeypatch.setattr(server, "client", fake)
 
     asyncio.run(server.create_batch_enrichment(enrichment_mode="raw", platform="instagram", csv_file_path=str(old / "list.csv")))
     assert fake.calls[0][3]["file"][1] == b"handle\nright\n"
+
+
+def test_batch_from_a_list_in_the_chat(monkeypatch):
+    """No client name and no file: the list is sent under the column its values name."""
+    from influencers_club_mcp import server
+
+    fake = FakeClient()
+    monkeypatch.setattr(server, "client", fake)
+    monkeypatch.setattr(server, "HTTP_MODE", True)
+
+    def create(**kw):
+        return json.loads(asyncio.run(server.create_batch_enrichment(**kw)))
+
+    assert create(values=["a@x.com", "b@x.com"])["detected_input_type"] == "email"  # the mode menu
+    assert create(values=["@john.doe", "@nike"])["detected_input_type"] == "handle"
+    for item in ("nike,adidas", "nike adidas"):
+        assert "one handle or email" in create(enrichment_mode="raw", platform="instagram", values=[item])["message"]
+    assert fake.calls == []
+    create(enrichment_mode="basic", values=[" a@x.com ", "", "b@x.com"])
+    create(enrichment_mode="raw", platform="instagram", values=["nike", "adidas"])
+    create(enrichment_mode="raw", platform="instagram", values=["a@x.com"])  # wrong mode: the API refuses the email column
+    assert [c[3]["file"][1] for c in fake.calls] == [b"email\na@x.com\nb@x.com", b"handle\nnike\nadidas", b"email\na@x.com"]
+
+
+def test_inline_batch_limit_is_in_the_schema():
+    from influencers_club_mcp import server
+
+    tools = {t.name: t for t in asyncio.run(server.mcp.list_tools())}
+    assert '"maxItems": 200' in json.dumps(tools["create_batch_enrichment"].inputSchema["properties"]["values"])
+
+
+def test_hosted_batch_never_reads_a_file_path(monkeypatch, tmp_path):
+    from influencers_club_mcp import server
+
+    on_the_server = tmp_path / "list.csv"
+    on_the_server.write_bytes(b"handle\nnike\n")
+    fake = FakeClient()
+    monkeypatch.setattr(server, "client", fake)
+    monkeypatch.setattr(server, "HTTP_MODE", True)
+    for mode in ("", "raw"):  # the mode menu reads the file too
+        out = json.loads(asyncio.run(server.create_batch_enrichment(
+            enrichment_mode=mode, platform="instagram", csv_file_path=str(on_the_server))))
+        assert "local install" in out["message"] and "detected_input_type" not in out
+    assert fake.calls == []
+
+
+def test_hosted_server_offers_the_batch_tools():
+    """The tool list is fixed at import, so hosted mode takes a fresh interpreter."""
+    import os
+    import subprocess
+    import sys
+
+    code = "from influencers_club_mcp import server; print(*(t.name for t in server.mcp._tool_manager.list_tools()))"
+    env = {**os.environ, "MCP_TRANSPORT": "http", "MCP_OAUTH_ENABLED": "false", "INFLUENCERS_CLUB_API_KEY": "dummy"}
+    names = set(subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True, check=True).stdout.split())
+    assert {"create_batch_enrichment", "get_batch_status", "resume_batch", "download_batch_results"} <= names
+    assert not {"get_upload_url", "wait_for_upload", "list_import_files", "discover_creators_to_file"} & names
+
+
+def test_status_waits_out_the_api_poll_limit(monkeypatch):
+    """Another server instance polled a moment ago: the tool waits and asks again, no error shown."""
+    from influencers_club_mcp import server
+    from influencers_club_mcp.api_client import ApiError
+
+    fake, naps = FakeClient(), []
+    answers = [ApiError(429, "Polling too frequently", retryable=True, code="polling_too_frequent"), {"status": "processing"}]
+
+    async def status(batch_id):
+        answer = answers.pop(0)
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    async def nap(seconds):
+        naps.append(seconds)
+
+    monkeypatch.setattr(server, "client", fake)
+    monkeypatch.setattr(fake.batch, "status", status)
+    monkeypatch.setattr(server.asyncio, "sleep", nap)
+    monkeypatch.setattr(server, "_batch_poll_cache", {})
+    out = json.loads(asyncio.run(server.get_batch_status(batch_id="bch_9")))
+    assert out["status"] == "processing" and naps == [30]
+    assert isinstance(server._batch_poll_cache["bch_9"], float)  # the time of the poll, not its result
 
 
 def test_setup_export_path_refuses_a_relative_folder(monkeypatch, tmp_path):

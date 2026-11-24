@@ -1,10 +1,11 @@
 """
 Handle/email detection for batch enrichment input.
-Shared by the upload page and inline csv_content in create_batch_enrichment.
+Shared by the upload page and create_batch_enrichment.
 """
 
 import csv
 import io
+import re
 
 VALID_HEADERS = ("email", "handle", "emails", "handles")
 
@@ -14,7 +15,8 @@ def _clean(value: str) -> str:
 
 
 def _is_email(value: str) -> bool:
-    return "@" in value and "." in value.split("@")[-1]
+    """Text before the @ and no slash, so @john.doe and tiktok.com/@john.doe stay handles."""
+    return bool(re.fullmatch(r"[^@\s/]+@[^@\s/]+\.[^@\s/]+", value))
 
 
 def mostly_emails(values: list[str]) -> bool:
@@ -33,9 +35,7 @@ def count_csv_rows(text: str) -> int:
     return max(0, len(lines) - 1)
 
 
-def to_single_column(
-    lines: list[str], *, first_line_is_header: bool
-) -> tuple[list[str], str, int | None] | None:
+def to_single_column(lines: list[str]) -> tuple[list[str], str, int | None] | None:
     """Reduce non-blank CSV lines to one handle/email column under an email/handle header.
 
     With several columns, the first one named email(s)/handle(s) is kept; failing that, the
@@ -43,9 +43,7 @@ def to_single_column(
     first column as handles. The first line is dropped as the header.
 
     A single column already named email(s)/handle(s) needs no change: returns None. Otherwise
-    its first five values decide the type. With first_line_is_header (the upload page) the
-    first line is replaced by the header; without it (inline lists) the first line is kept
-    as a value and the header goes above it.
+    its first five values decide the type and the first line is replaced by the header.
 
     Returns (lines, "email" or "handle", kept column index, or None for one-column input).
     Raises ValueError when a single column has no values to decide from.
@@ -79,7 +77,7 @@ def to_single_column(
 
     if header_cols[0] in VALID_HEADERS:
         return None
-    values = lines[1:] if first_line_is_header else lines
+    values = lines[1:]
     sample = [v for v in map(_clean, values[:5]) if v]
     if not sample:
         raise ValueError("CSV has no data rows")
