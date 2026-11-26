@@ -520,6 +520,27 @@ def test_download_file_streams_and_never_shows_the_link(tmp_path):
     assert "secret" not in str(err.value) and not target.exists()
 
 
+def test_cancelled_download_leaves_no_partial_file(tmp_path):
+    async def body():
+        yield b"handle\n"
+        await asyncio.sleep(3600)  # hangs until cancelled
+
+    client = InfluencersApiClient()
+    client._client = httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(200, content=body())))
+    target = tmp_path / "r.csv"
+
+    async def cancel_mid_download():
+        task = asyncio.create_task(client.download_file("https://s3.test/r.csv", target))
+        while not target.exists() and not task.done():
+            await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(cancel_mid_download())
+    assert not target.exists()
+
+
 def test_api_error_keeps_the_error_code():
     resp = httpx.Response(400, json={"error": "x", "error_code": "results_not_ready"}, request=httpx.Request("GET", "http://t"))
     err = InfluencersApiClient()._handle_error(httpx.HTTPStatusError("boom", request=resp.request, response=resp))

@@ -388,7 +388,7 @@ class InfluencersApiClient:
                 with open(path, "wb") as fh:
                     async for chunk in resp.aiter_bytes():
                         fh.write(chunk)
-        except Exception as e:
+        except BaseException as e:  # also a cancelled download
             path.unlink(missing_ok=True)  # no half-written file left behind
             if isinstance(e, httpx.HTTPError):
                 # httpx puts the URL in its message; a signed link must not reach the chat.
