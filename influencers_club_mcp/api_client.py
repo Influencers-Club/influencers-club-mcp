@@ -14,6 +14,7 @@ import logging
 import os
 import re
 import time
+from pathlib import Path
 from typing import Any, Callable, NamedTuple
 
 import httpx
@@ -45,6 +46,8 @@ def _sanitize(text: str) -> str:
 
 
 logger = logging.getLogger(__name__)
+# httpx logs every request URL at INFO; a presigned link is a credential until it expires.
+logging.getLogger("httpx").addFilter(lambda record: "Signature=" not in record.getMessage())
 
 
 def _flatten_error(value: Any) -> str:
@@ -68,8 +71,9 @@ class RateLimitError(Exception):
 class ApiError(Exception):
     """Structured API error with status code and retryability."""
 
-    def __init__(self, status: int, message: str, retryable: bool = False):
+    def __init__(self, status: int, message: str, retryable: bool = False, code: str = ""):
         self.status = status
+        self.code = code  # the API's error_code slug, "" when it sent none
         self.message = _sanitize(message)
         self.retryable = retryable
         super().__init__(self.message)
@@ -293,10 +297,12 @@ class InfluencersApiClient:
             return e
         if isinstance(e, httpx.HTTPStatusError):
             status = e.response.status_code
+            code = ""
             try:
                 body = e.response.json()
                 msg = None
                 if isinstance(body, dict):
+                    code = str(body.get("error_code") or "")
                     msg = (body.get("message") or body.get("detail") or body.get("error")
                            or body.get("response_meta", {}).get("error_message"))
                 if isinstance(msg, (list, dict)):
@@ -308,7 +314,7 @@ class InfluencersApiClient:
                     msg = f"API error {status}: {_sanitize(json.dumps(body, ensure_ascii=False)[:300])}"
             except Exception:
                 msg = f"API error {status}: {_sanitize(e.response.text[:200])}"
-            return ApiError(status, str(msg), retryable=(status == 429 or status >= 500))
+            return ApiError(status, str(msg), retryable=(status == 429 or status >= 500), code=code)
         if isinstance(e, httpx.TimeoutException):
             return ApiError(408, "Request timed out", retryable=True)
         if isinstance(e, RateLimitError):
@@ -372,6 +378,22 @@ class InfluencersApiClient:
     ) -> Any:
         """Make a DELETE request, with a JSON body where the endpoint takes one."""
         return await self._send_json("DELETE", path, body, timeout)
+
+    async def download_file(self, url: str, path: Path, timeout: float = BATCH_TIMEOUT) -> None:
+        """Stream a presigned link to ``path``. The link signs itself, so no API credentials go with it."""
+        client = await self._get_client()
+        try:
+            async with client.stream("GET", url, timeout=timeout) as resp:
+                resp.raise_for_status()
+                with open(path, "wb") as fh:
+                    async for chunk in resp.aiter_bytes():
+                        fh.write(chunk)
+        except BaseException as e:  # also a cancelled download
+            path.unlink(missing_ok=True)  # no half-written file left behind
+            if isinstance(e, httpx.HTTPError):
+                # httpx puts the URL in its message; a signed link must not reach the chat.
+                raise ApiError(502, f"Downloading the results file failed ({type(e).__name__})", retryable=True) from None
+            raise
 
     async def post_multipart(
         self, path: str, files: dict, data: dict[str, str], timeout: float = BATCH_TIMEOUT
